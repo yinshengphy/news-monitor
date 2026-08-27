@@ -1,0 +1,4 @@
+# Standard library is primarily used (urllib, sqlite3, xml.etree, concurrent.futures)
+# Additional optional packages for Hermes compatibility
+requests>=2.31.0
+aiohttp>=3.9.0
