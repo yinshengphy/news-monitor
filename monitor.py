@@ -360,15 +360,22 @@ def call_gemini(model_name: str, prompt: str) -> tuple[bool, str]:
 
 def call_codex(prompt: str) -> tuple[bool, str]:
     try:
-        sys.path.insert(0, "/home/yinsheng/.hermes/hermes-agent")
-        from agent.credential_pool import load_pool
-        pool = load_pool("openai-codex")
-        entry = pool.select()
-        if not entry:
-            return False, "No active openai-codex account in auth.json"
-        token = entry.access_token() if callable(entry.access_token) else entry.access_token
+        # Load token directly from auth.json
+        auth_paths = ["/home/yinsheng/.hermes/auth.json", os.path.expanduser("~/.hermes/auth.json")]
+        token = None
+        for p in auth_paths:
+            if os.path.exists(p):
+                try:
+                    with open(p) as f:
+                        auth_data = json.load(f)
+                    pool = auth_data.get("credential_pool", {}).get("openai-codex", [])
+                    if pool and pool[0].get("access_token"):
+                        token = pool[0]["access_token"]
+                        break
+                except Exception:
+                    pass
         if not token:
-            return False, "Codex token empty"
+            return False, "No active openai-codex token found in auth.json"
         
         url = "https://chatgpt.com/backend-api/codex"
         body = json.dumps({
@@ -404,6 +411,47 @@ def call_deepseek(prompt: str) -> tuple[bool, str]:
             return True, data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return False, str(e)
+
+# ----------------- Fallback Alert Notification -----------------
+LAST_FALLBACK_ALERT_TIME = None
+FALLBACK_ALERT_COOLDOWN_SECONDS = 3600  # 1 hour cooldown between alerts
+
+def notify_fallback_alert(failed_models: list[str], fallback_model: str, error_details: dict):
+    """
+    Directly alerts the user via WeChat when all primary models fail and system degrades to fallback.
+    Throttled by 1 hour cooldown to prevent spam.
+    """
+    global LAST_FALLBACK_ALERT_TIME
+    now = datetime.now(timezone.utc)
+    if LAST_FALLBACK_ALERT_TIME is not None:
+        elapsed = (now - LAST_FALLBACK_ALERT_TIME).total_seconds()
+        if elapsed < FALLBACK_ALERT_COOLDOWN_SECONDS:
+            return
+
+    bj_time = (now + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    failed_str = "、".join(failed_models)
+    
+    err_lines = ""
+    for m, err in error_details.items():
+        err_lines += f"\n• **{m}**：`{err[:100]}`"
+
+    msg = f"""⚠️ **【监控服务告警】资讯研判模型触发降级回退**
+───────────────────────
+⏰ **告警时间**：{bj_time}
+🚨 **故障主模型**：{failed_str}
+🔄 **当前接管**：{fallback_model}
+
+📋 **异常详情**：{err_lines}
+
+💡 *系统已自动启用备用模型继续保障新闻过滤，请在空闲时检查主模型/凭据状态。*"""
+
+    print(f"\n[ALERT] Triggering WeChat fallback alert notification...", flush=True)
+    ok, err = send_weixin_direct_call(msg)
+    if ok:
+        print("[ALERT] Fallback alert sent successfully to WeChat.", flush=True)
+        LAST_FALLBACK_ALERT_TIME = now
+    else:
+        print(f"[ALERT Error] Failed to send fallback alert: {err}", flush=True)
 
 def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
     """
@@ -450,6 +498,8 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
     model_used = None
     deepseek_only = False
     result_text = None
+    failed_models = []
+    error_details = {}
 
     # Step 1: Primary - Gemini 3.7 Flash High
     ok, res = call_gemini("gemini-3.7-flash-high", prompt)
@@ -458,29 +508,28 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
         result_text = res
     else:
         print(f"[Fallback] Gemini 3.7 Flash failed: {res}")
-        # Step 2: Fallback 1 - OpenAI Codex
-        ok, res = call_codex(prompt)
+        failed_models.append("Gemini 3.7 Flash")
+        error_details["Gemini 3.7 Flash"] = res
+        # Step 2: Fallback 1 - Gemini 3.1 Pro Low
+        ok, res = call_gemini("gemini-3.1-pro-low", prompt)
         if ok:
-            model_used = "OpenAI Codex (gpt-5.6-luna)"
+            model_used = "Gemini 3.1 Pro Low"
             result_text = res
         else:
-            print(f"[Fallback] OpenAI Codex failed: {res}")
-            # Step 3: Fallback 2 - Gemini 3.1 Pro Low
-            ok, res = call_gemini("gemini-3.1-pro-low", prompt)
+            print(f"[Fallback] Gemini 3.1 Pro failed: {res}")
+            failed_models.append("Gemini 3.1 Pro")
+            error_details["Gemini 3.1 Pro"] = res
+            # Step 3: Fallback 2 - DeepSeek V4 Flash
+            ok, res = call_deepseek(prompt)
             if ok:
-                model_used = "Gemini 3.1 Pro Low"
+                model_used = "DeepSeek V4 Flash"
+                deepseek_only = True
                 result_text = res
+                # Trigger instant out-of-band WeChat alert
+                notify_fallback_alert(failed_models, "DeepSeek V4 Flash", error_details)
             else:
-                print(f"[Fallback] Gemini 3.1 Pro failed: {res}")
-                # Step 4: Fallback 3 - DeepSeek V4 Flash
-                ok, res = call_deepseek(prompt)
-                if ok:
-                    model_used = "DeepSeek V4 Flash"
-                    deepseek_only = True
-                    result_text = res
-                else:
-                    print(f"[Error] All models failed! DeepSeek error: {res}")
-                    return {"score": 0, "error": "all_models_failed"}
+                print(f"[Error] All models failed! DeepSeek error: {res}")
+                return {"score": 0, "error": "all_models_failed"}
 
     # Extract JSON
     try:
@@ -535,8 +584,9 @@ def format_wechat_card(news_meta: dict, analysis: dict) -> str:
 
 来源：{source}（{time_display}）"""
 
+    # Check for DeepSeek-only notice at end of news card
     if analysis.get("deepseek_only_notice"):
-        msg += "\n\n⚠️ 【系统通知】上游主模型当前不可用，已自动切换至 DeepSeek 兜底研判。"
+        msg += "\n\n⚠️ 【系统附注】上游主模型当前不可用，已自动切换至 DeepSeek 兜底研判。"
 
     return msg
 
