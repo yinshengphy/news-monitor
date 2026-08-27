@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Global Breaking News Monitoring Service (Production Grade)
+Global Breaking News Monitoring Service (Production Grade v2)
 - Concurrent multi-source RSS & GeoJSON ingestion
 - Outbox pattern for reliable WeChat delivery with exponential backoff
-- Cross-media event deduplication and 4-hour topic cooldown
+- Enhanced topic deduplication: geographic entity normalization + LLM active incident context
 - Multi-tier LLM evaluation fallback chain (Gemini -> Codex -> Gemini Pro -> DeepSeek)
 - Clean WeChat card typography without unrendered Markdown and raw URLs
 - Watchdog heartbeat monitoring
@@ -150,7 +150,7 @@ def init_db():
     )
     """)
     
-    # Check and perform table migrations for outbox and deduplication
+    # Migrations
     cur.execute("PRAGMA table_info(processed_items)")
     columns = [col[1] for col in cur.fetchall()]
     
@@ -165,7 +165,7 @@ def init_db():
     if "wechat_msg" not in columns:
         cur.execute("ALTER TABLE processed_items ADD COLUMN wechat_msg TEXT")
 
-    # 2. Active incidents table for 4-hour topic cooldown
+    # 2. Active incidents table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS active_incidents (
         incident_key TEXT PRIMARY KEY,
@@ -213,61 +213,118 @@ def record_item(item_hash: str, source: str, title: str, link: str, published_at
     conn.commit()
     conn.close()
 
-# ----------------- Topic Deduplication & Cooldown -----------------
-def generate_incident_key(location: str, level: str, title: str) -> str:
-    """
-    Extract a normalized incident key based on location and disaster type
-    to group follow-up reports of the same event.
-    """
-    clean_loc = re.sub(r"[\s\-_,，·/]+", "", location or "未知")
-    clean_level = re.sub(r"[\s\-_,，·/]+", "", level or "突发")
-    
-    if clean_loc not in ["未知", "全球", "中国", "国际", "待确认"]:
-        return f"{clean_loc}_{clean_level}"
-    
-    # Fallback to key nouns in title
-    nouns = re.findall(r"[\u4e00-\u9fa5]{2,6}", title)
-    fallback_noun = nouns[0] if nouns else "突发事件"
-    return f"{fallback_noun}_{clean_level}"
+# ----------------- Topic Deduplication & Entity Normalization -----------------
+ADMIN_SUFFIXES = ["中国", "自治区", "特别行政区", "壮族", "维吾尔", "回族", "藏族", "蒙古", "省", "市", "地区", "州", "盟", "县", "区", "镇", "乡", "口岸", "海域", "附近"]
 
-def check_incident_cooldown(incident_key: str, score: int, location: str, level: str, title: str) -> tuple[bool, str]:
+def extract_geo_tokens(location: str, title: str) -> set[str]:
     """
-    Check if this incident has already been pushed in the last 4 hours (14400s).
-    Returns (should_push, reason).
+    Extract normalized geographic entities (e.g. {'西藏', '日喀则', '吉隆'})
+    stripping common administrative decorations.
+    """
+    text = f"{location} {title}"
+    # Extract 2-4 character Chinese tokens
+    words = re.findall(r"[\u4e00-\u9fa5]{2,4}", text)
+    clean_tokens = set()
+    for w in words:
+        cleaned = w
+        for suffix in ADMIN_SUFFIXES:
+            if len(cleaned) > 2 and cleaned.endswith(suffix):
+                cleaned = cleaned[:-len(suffix)]
+            elif cleaned == suffix:
+                cleaned = ""
+        if len(cleaned) >= 2 and cleaned not in ["事故", "灾害", "发生", "启动", "响应", "救援", "突发", "国家", "最新", "现场"]:
+            clean_tokens.add(cleaned)
+    return clean_tokens
+
+def extract_event_type(level: str, title: str) -> str:
+    types = ["泥石流", "地震", "山洪", "暴雨", "滑坡", "海啸", "爆炸", "坠毁", "空袭", "袭击", "交火", "政变", "大火", "坍塌", "台风", "飓风"]
+    combined = f"{level} {title}"
+    for t in types:
+        if t in combined:
+            return t
+    return "突发事件"
+
+def get_active_incidents_summary() -> list[dict]:
+    """
+    Fetch active incidents from the last 4 hours for LLM context injection.
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-    SELECT incident_key, last_pushed_at, highest_score, first_title
+    SELECT incident_key, location, level, highest_score, first_title, last_pushed_at
     FROM active_incidents
-    WHERE incident_key = ?
-    """, (incident_key,))
-    row = cur.fetchone()
+    ORDER BY last_pushed_at DESC
+    LIMIT 6
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    
+    summary = []
+    now_utc = datetime.now(timezone.utc)
+    for r in rows:
+        try:
+            last_dt = datetime.fromisoformat(r[5])
+            mins = int((now_utc - last_dt).total_seconds() / 60)
+            summary.append({
+                "key": r[0],
+                "location": r[1],
+                "level": r[2],
+                "score": r[3],
+                "title": r[4],
+                "elapsed_mins": mins
+            })
+        except Exception:
+            pass
+    return summary
+
+def check_incident_cooldown_enhanced(location: str, level: str, title: str, score: int, is_followup_llm: bool) -> tuple[bool, str, str]:
+    """
+    Enhanced deduplication:
+    1. Checks if LLM flagged it as followup
+    2. Checks fuzzy token overlap against active_incidents within 4 hours
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT incident_key, location, level, last_pushed_at, highest_score, first_title FROM active_incidents")
+    rows = cur.fetchall()
     now_utc = datetime.now(timezone.utc)
     now_str = now_utc.isoformat()
 
-    if row:
-        last_pushed_str, highest_score, first_title = row[1], row[2], row[3]
+    new_tokens = extract_geo_tokens(location, title)
+    new_type = extract_event_type(level, title)
+    canonical_key = f"{''.join(sorted(list(new_tokens))[:3])}_{new_type}" if new_tokens else f"{title[:10]}_{new_type}"
+
+    for row in rows:
+        inc_key, exist_loc, exist_level, last_pushed_str, highest_score, first_title = row
         try:
             last_pushed_dt = datetime.fromisoformat(last_pushed_str)
             elapsed_seconds = (now_utc - last_pushed_dt).total_seconds()
         except Exception:
             elapsed_seconds = 999999
 
-        # 4 hours cooldown window (14,400s)
+        # Active within 4 hours (14400s)
         if elapsed_seconds < 14400:
-            if score >= highest_score + 12:
-                cur.execute("""
-                UPDATE active_incidents
-                SET last_pushed_at = ?, highest_score = ?
-                WHERE incident_key = ?
-                """, (now_str, max(highest_score, score), incident_key))
-                conn.commit()
-                conn.close()
-                return True, f"Major escalation (+{score - highest_score} pts)"
+            exist_tokens = extract_geo_tokens(exist_loc, first_title)
+            exist_type = extract_event_type(exist_level, first_title)
             
-            conn.close()
-            return False, f"Cooldown active ({int(elapsed_seconds/60)}m ago: {first_title[:25]})"
+            # Check overlap
+            common_tokens = new_tokens & exist_tokens
+            type_match = (new_type == exist_type) or ("灾害" in new_type and "灾害" in exist_type)
+            
+            if (len(common_tokens) >= 1 and type_match) or is_followup_llm or (canonical_key == inc_key):
+                # Matched active incident!
+                if score >= highest_score + 15:
+                    cur.execute("""
+                    UPDATE active_incidents
+                    SET last_pushed_at = ?, highest_score = ?
+                    WHERE incident_key = ?
+                    """, (now_str, max(highest_score, score), inc_key))
+                    conn.commit()
+                    conn.close()
+                    return True, f"Major escalation (+{score - highest_score} pts)", inc_key
+                
+                conn.close()
+                return False, f"Cooldown active ({int(elapsed_seconds/60)}m ago: {first_title[:25]})", inc_key
 
     # New incident
     cur.execute("""
@@ -276,10 +333,10 @@ def check_incident_cooldown(incident_key: str, score: int, location: str, level:
     ON CONFLICT(incident_key) DO UPDATE SET
         last_pushed_at=excluded.last_pushed_at,
         highest_score=excluded.highest_score
-    """, (incident_key, location, level, now_str, now_str, score, title))
+    """, (canonical_key, location, level, now_str, now_str, score, title))
     conn.commit()
     conn.close()
-    return True, "New incident registered"
+    return True, "New incident registered", canonical_key
 
 # ----------------- Model Inference Pipeline -----------------
 def call_gemini(model_name: str, prompt: str) -> tuple[bool, str]:
@@ -350,13 +407,22 @@ def call_deepseek(prompt: str) -> tuple[bool, str]:
 
 def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
     """
-    Evaluates news significance (0-100) and formats breaking alert metadata if score >= 80.
+    Evaluates news significance (0-100) with active incident awareness.
     """
+    recent_incidents = get_active_incidents_summary()
+    recent_context = ""
+    if recent_incidents:
+        recent_context = "【近期已推送的重大事件（4小时内，请防止重复）】：\n"
+        for inc in recent_incidents:
+            recent_context += f"- [{inc['elapsed_mins']}分钟前] {inc['location']} | {inc['level']} | 标题: {inc['title']} (得分:{inc['score']})\n"
+    
     prompt = f"""你是一个顶尖全球重大新闻与突发事件研判专家。
 请根据以下新闻线索进行分析评估：
 【来源】：{source}
 【标题】：{title}
 【内容/摘要】：{snippet}
+
+{recent_context}
 
 研判标准：
 1. 重大突发标准（得分 80-100 分）：
@@ -365,14 +431,16 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
    - 重大国家安全/战争冲突（开火、突发空袭、政变、军事突发行动）
    - 顶级政经与科技震荡（全球核心市场剧变、关键断供、关键领导人突发变故）
 2. 普通新闻、日常言论、娱乐、体育、常规财报：得分低于 75 分。
+3. 【关键防重复规则】：若该新闻仅仅是上述【近期已推送事件】的后续工作进展、例行会议、保险理赔、一般性增援且**未发生伤亡人数剧变**，必须设置 "is_followup_of_recent": true，且 score 不得高于 75 分！
 
 请严格输出 JSON 格式（不要输出 markdown 代码块标记以外的多余文字）：
 {{
   "score": 85,
   "is_breaking": true,
+  "is_followup_of_recent": false,
   "level": "特大自然灾害",
   "verified_status": "海外主流媒体首发·待官方通报 / 官方权威已确认 / 多源已证实",
-  "location": "事件发生地点",
+  "location": "西藏日喀则吉隆县",
   "time_str": "发生时间（若已知）",
   "core_facts": "核心事实一句话说明",
   "impact": "人员伤亡、交通/基础设施或区域影响",
@@ -429,10 +497,6 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
 
 # ----------------- WeChat Formatter & Outbox Dispatcher -----------------
 def format_wechat_card(news_meta: dict, analysis: dict) -> str:
-    """
-    Format clean WeChat alert without markdown asterisk bugs and without raw URL links.
-    Standardized tail format: 来源：媒体名称（YYYY-MM-DD HH:MM）
-    """
     title = news_meta.get("title", "")
     source = news_meta.get("source", "未知信源")
     
@@ -445,7 +509,6 @@ def format_wechat_card(news_meta: dict, analysis: dict) -> str:
     impact = analysis.get("impact", "尚在评估中")
     summary = analysis.get("summary", "")
     
-    # Format date/time
     now = datetime.now()
     if not time_str or "已知" in time_str or time_str == "刚刚":
         time_display = now.strftime("%Y-%m-%d %H:%M")
@@ -506,14 +569,6 @@ def send_weixin_direct_call(message: str) -> tuple[bool, str]:
         return False, str(e)
 
 def flush_outbox():
-    """
-    Scan push queue and retry failed or pending messages with exponential backoff.
-    push_status:
-      0: Non-breaking / routine
-      1: Pending push / retrying
-      2: Push delivered successfully
-      3: Permanent failure after max retries
-    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -535,7 +590,6 @@ def flush_outbox():
         if not msg:
             continue
             
-        # Exponential backoff check
         if last_retry_str:
             try:
                 last_retry_dt = datetime.fromisoformat(last_retry_str)
@@ -626,7 +680,6 @@ def fetch_usgs_single(name: str, cfg: dict) -> list[dict]:
                 time_ms = props.get("time", 0)
                 url_quake = props.get("url", "")
                 
-                # USGS Smart Filtering: Only process M>=6.0 globally, or M>=4.5 for East Asia/China coordinates
                 coords = f.get("geometry", {}).get("coordinates", [0, 0])
                 lon, lat = coords[0], coords[1]
                 is_near_china = (70 <= lon <= 135) and (15 <= lat <= 55)
@@ -748,7 +801,6 @@ def poll_all():
         snippet = item["snippet"]
         source = item["source"]
         
-        # Fast rule filter
         is_candidate = quick_filter(title, snippet)
         if not is_candidate:
             record_item(item["hash"], source, title, item["link"], item["published_at"], 
@@ -760,15 +812,15 @@ def poll_all():
         analysis = evaluate_and_summarize(title, snippet, source)
         score = analysis.get("score", 0)
         is_breaking = analysis.get("is_breaking", False)
+        is_followup = analysis.get("is_followup_of_recent", False)
         location = analysis.get("location", "未知")
         level = analysis.get("level", "重大突发")
         
-        print(f" -> Score: {score} | Breaking: {is_breaking} | Model: {analysis.get('model_used')}", flush=True)
+        print(f" -> Score: {score} | Breaking: {is_breaking} | Followup: {is_followup} | Model: {analysis.get('model_used')}", flush=True)
         
-        if score >= 80 or is_breaking:
-            # 3. Topic Cooldown & Anti-Spam Check
-            incident_key = generate_incident_key(location, level, title)
-            should_push, reason = check_incident_cooldown(incident_key, score, location, level, title)
+        if (score >= 80 or is_breaking) and not is_followup:
+            # 3. Enhanced Topic Cooldown & Fuzzy Anti-Spam Check
+            should_push, reason, incident_key = check_incident_cooldown_enhanced(location, level, title, score, is_followup)
             
             if should_push:
                 print(f" -> [PUSH ACCEPTED] Incident '{incident_key}': {reason}", flush=True)
@@ -791,7 +843,7 @@ def poll_all():
 
 def main():
     init_db()
-    print("=== Global Breaking News Monitoring Service (Production) Started ===")
+    print("=== Global Breaking News Monitoring Service (Production v2) Started ===")
     print(f"Database: {DB_PATH}")
     print(f"Poll Interval: {POLL_INTERVAL_SECONDS}s")
     print(f"Heartbeat Path: {HEARTBEAT_PATH}")
