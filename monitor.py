@@ -527,7 +527,6 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
     """
     Evaluates news significance (0-100) with active incident awareness.
     """
-    flush_pending_model_alert()
     recent_incidents = get_active_incidents_summary()
     recent_context = ""
     if recent_incidents:
