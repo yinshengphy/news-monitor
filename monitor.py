@@ -378,51 +378,156 @@ def call_cliproxy(model_name: str, prompt: str) -> tuple[bool, str]:
     except Exception as e:
         return False, f"request error: {e}"
 
-# ----------------- Fallback Alert Notification -----------------
-LAST_FALLBACK_ALERT_TIME = None
-FALLBACK_ALERT_COOLDOWN_SECONDS = 3600  # 1 hour cooldown between alerts
+# ----------------- Model Interface State Alerts -----------------
+PRIMARY_HEALTH_KEY = "model_health_primary"
+FALLBACK_HEALTH_KEY = "model_health_fallback"
+MODEL_ALERT_PENDING_KEY = "model_alert_pending"
 
-def notify_fallback_alert(failed_models: list[str], fallback_model: str, error_details: dict):
-    """
-    Directly alerts the user via WeChat when all primary models fail and system degrades to fallback.
-    Throttled by 1 hour cooldown to prevent spam.
-    """
-    global LAST_FALLBACK_ALERT_TIME
-    now = datetime.now(timezone.utc)
-    if LAST_FALLBACK_ALERT_TIME is not None:
-        elapsed = (now - LAST_FALLBACK_ALERT_TIME).total_seconds()
-        if elapsed < FALLBACK_ALERT_COOLDOWN_SECONDS:
-            return
 
-    bj_time = (now + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    failed_str = "、".join(failed_models)
-    
-    err_lines = ""
-    for m, err in error_details.items():
-        err_lines += f"\n• **{m}**：`{err[:100]}`"
+def get_system_state(key: str, default: str = "") -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return row[0] if row else default
+    except Exception as e:
+        print(f"[State Warning] Failed to read {key}: {e}", flush=True)
+        return default
 
-    msg = f"""⚠️ **【监控服务告警】资讯研判模型触发降级回退**
+
+def _upsert_system_state(cur, key: str, value: str):
+    cur.execute("""
+    INSERT INTO system_state (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+        value=excluded.value,
+        updated_at=excluded.updated_at
+    """, (key, value, datetime.now(timezone.utc).isoformat()))
+
+
+def _short_model_error(error: str) -> str:
+    compact = re.sub(r"\s+", " ", str(error or "unknown error")).strip()
+    status_match = re.search(r"HTTP\s+(\d+)", compact, re.IGNORECASE)
+    message_match = re.search(r'"message"\s*:\s*"([^"]+)"', compact)
+    if status_match and message_match:
+        return f"HTTP {status_match.group(1)}：{message_match.group(1)}"[:220]
+    return compact[:220]
+
+
+def _build_model_alert(title: str, details: list[str]) -> str:
+    bj_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    detail_text = "\n".join(f"• {line}" for line in details)
+    return f"""{title}
 ───────────────────────
-⏰ **告警时间**：{bj_time}
-🚨 **故障主模型**：{failed_str}
-🔄 **当前接管**：{fallback_model}
+时间：{bj_time}
+{detail_text}
 
-📋 **异常详情**：{err_lines}
+调用顺序：{PRIMARY_MODEL} → {FALLBACK_MODEL}
+说明：仅在模型接口状态发生变化时提醒，不会重复发送相同故障。"""
 
-💡 *系统已自动启用备用模型继续保障新闻过滤，请在空闲时检查主模型/凭据状态。*"""
 
-    print(f"\n[ALERT] Triggering WeChat fallback alert notification...", flush=True)
-    ok, err = send_weixin_direct_call(msg)
-    if ok:
-        print("[ALERT] Fallback alert sent successfully to WeChat.", flush=True)
-        LAST_FALLBACK_ALERT_TIME = now
-    else:
-        print(f"[ALERT Error] Failed to send fallback alert: {err}", flush=True)
+def _save_model_health_and_alert(primary_state: str, fallback_state: str, alert_message: str = ""):
+    """Persist health transitions and queue any alert atomically."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        _upsert_system_state(cur, PRIMARY_HEALTH_KEY, primary_state)
+        _upsert_system_state(cur, FALLBACK_HEALTH_KEY, fallback_state)
+        if alert_message:
+            row = cur.execute(
+                "SELECT value FROM system_state WHERE key = ?", (MODEL_ALERT_PENDING_KEY,)
+            ).fetchone()
+            pending = row[0] if row else ""
+            combined = f"{pending}\n\n{alert_message}".strip() if pending else alert_message
+            _upsert_system_state(cur, MODEL_ALERT_PENDING_KEY, combined[-3500:])
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[State Error] Failed to persist model health: {e}", flush=True)
+
+
+def flush_pending_model_alert():
+    message = get_system_state(MODEL_ALERT_PENDING_KEY)
+    if not message:
+        return
+    print("[MODEL ALERT] Sending queued model interface status notification...", flush=True)
+    ok, err = send_weixin_direct_call(message)
+    if not ok:
+        print(f"[MODEL ALERT Error] Delivery failed and will retry: {err}", flush=True)
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM system_state WHERE key = ?", (MODEL_ALERT_PENDING_KEY,))
+        conn.commit()
+        conn.close()
+        print("[MODEL ALERT] Notification delivered successfully.", flush=True)
+    except Exception as e:
+        print(f"[State Warning] Alert sent but pending state cleanup failed: {e}", flush=True)
+
+
+def record_model_outcome(
+    primary_ok: bool,
+    primary_error: str = "",
+    fallback_attempted: bool = False,
+    fallback_ok: bool | None = None,
+    fallback_error: str = "",
+):
+    """Send transition-only alerts for primary/fallback failure and recovery."""
+    previous_primary = get_system_state(PRIMARY_HEALTH_KEY, "unknown")
+    previous_fallback = get_system_state(FALLBACK_HEALTH_KEY, "unknown")
+    new_primary = "healthy" if primary_ok else "unhealthy"
+    new_fallback = previous_fallback
+    alert_message = ""
+
+    if primary_ok:
+        if previous_primary == "unhealthy":
+            alert_message = _build_model_alert(
+                "✅ 模型接口恢复提醒｜主模型已恢复",
+                [
+                    f"主模型 {PRIMARY_MODEL} 已恢复正常，后续研判已自动切回主模型。",
+                    f"备用模型 {FALLBACK_MODEL} 保持待命。",
+                ],
+            )
+    elif fallback_attempted and fallback_ok is True:
+        new_fallback = "healthy"
+        details = []
+        if previous_primary != "unhealthy":
+            details.extend([
+                f"主模型 {PRIMARY_MODEL} 调用失败：{_short_model_error(primary_error)}",
+                f"已切换至备用模型 {FALLBACK_MODEL}，当前接管成功。",
+            ])
+        if previous_fallback == "unhealthy":
+            details.append(f"备用模型 {FALLBACK_MODEL} 已恢复正常。")
+        if details:
+            title = (
+                "✅ 模型接口恢复提醒｜备用模型已恢复并接管"
+                if previous_primary == "unhealthy" and previous_fallback == "unhealthy"
+                else "⚠️ 模型接口切换提醒｜主模型已切换至备用"
+            )
+            alert_message = _build_model_alert(title, details)
+    elif fallback_attempted and fallback_ok is False:
+        new_fallback = "unhealthy"
+        if previous_primary != "unhealthy" or previous_fallback != "unhealthy":
+            details = []
+            if previous_primary != "unhealthy":
+                details.append(f"主模型 {PRIMARY_MODEL} 调用失败：{_short_model_error(primary_error)}")
+            details.append(f"备用模型 {FALLBACK_MODEL} 调用失败：{_short_model_error(fallback_error)}")
+            details.append("主、备用模型当前均不可用，本轮新闻研判已安全终止，不会推送未研判内容。")
+            title = (
+                "🚨 模型接口故障提醒｜主备模型均失败"
+                if previous_primary != "unhealthy"
+                else "🚨 模型接口故障提醒｜备用模型也已失败"
+            )
+            alert_message = _build_model_alert(title, details)
+
+    _save_model_health_and_alert(new_primary, new_fallback, alert_message)
+    flush_pending_model_alert()
 
 def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
     """
     Evaluates news significance (0-100) with active incident awareness.
     """
+    flush_pending_model_alert()
     recent_incidents = get_active_incidents_summary()
     recent_context = ""
     if recent_incidents:
@@ -464,25 +569,35 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
     model_used = None
     fallback_used = False
     result_text = None
-    failed_models = []
-    error_details = {}
-
     # Step 1: Primary - Gemini 3.7 Flash High through host CLIProxyAPI
     ok, res = call_cliproxy(PRIMARY_MODEL, prompt)
     if ok:
+        record_model_outcome(primary_ok=True)
         model_used = "Gemini 3.7 Flash High"
         result_text = res
     else:
         print(f"[Fallback] Gemini 3.7 Flash failed: {res}")
-        failed_models.append("Gemini 3.7 Flash")
-        error_details["Gemini 3.7 Flash"] = res
+        primary_error = res
         # Step 2: First and only fallback - Codex GPT Luna through the same gateway
         ok, res = call_cliproxy(FALLBACK_MODEL, prompt)
         if ok:
+            record_model_outcome(
+                primary_ok=False,
+                primary_error=primary_error,
+                fallback_attempted=True,
+                fallback_ok=True,
+            )
             model_used = "GPT-5.6 Luna"
             fallback_used = True
             result_text = res
         else:
+            record_model_outcome(
+                primary_ok=False,
+                primary_error=primary_error,
+                fallback_attempted=True,
+                fallback_ok=False,
+                fallback_error=res,
+            )
             print(f"[Error] Both configured models failed! GPT Luna error: {res}")
             return {"score": 0, "error": "all_models_failed"}
 
