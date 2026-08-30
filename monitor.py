@@ -4,7 +4,7 @@ Global Breaking News Monitoring Service (Production Grade v2)
 - Concurrent multi-source RSS & GeoJSON ingestion
 - Outbox pattern for reliable WeChat delivery with exponential backoff
 - Enhanced topic deduplication: geographic entity normalization + LLM active incident context
-- Multi-tier LLM evaluation fallback chain (Gemini -> Codex -> Gemini Pro -> DeepSeek)
+- Strict LLM evaluation fallback chain through host CLIProxyAPI (Gemini -> Codex Luna)
 - Clean WeChat card typography without unrendered Markdown and raw URLs
 - Watchdog heartbeat monitoring
 """
@@ -17,6 +17,7 @@ import sqlite3
 import hashlib
 import re
 import urllib.request
+import urllib.error
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -28,7 +29,10 @@ HERMES_HOME = os.environ.get("HERMES_HOME", "/home/yinsheng/.hermes")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "180"))
 HTTP_PROXY = os.environ.get("HTTP_PROXY", "http://127.0.0.1:7890")
 CLIPROXY_KEY = os.environ.get("CLIPROXY_API_KEY", "")
-DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+CLIPROXY_BASE_URL = os.environ.get("CLIPROXY_BASE_URL", "http://127.0.0.1:8317/v1").rstrip("/")
+PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "gemini-3.7-flash-high")
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-5.6-luna")
+MODEL_TIMEOUT_SECONDS = int(os.environ.get("MODEL_TIMEOUT_SECONDS", "25"))
 TARGET_WEIXIN = os.environ.get("WEIXIN_RECEIVER", "o9cq80-itgP5_UnL3cyqo9gv9JBg@im.wechat")
 HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", "/tmp/news_monitor_heartbeat")
 
@@ -339,10 +343,11 @@ def check_incident_cooldown_enhanced(location: str, level: str, title: str, scor
     return True, "New incident registered", canonical_key
 
 # ----------------- Model Inference Pipeline -----------------
-def call_gemini(model_name: str, prompt: str) -> tuple[bool, str]:
+def call_cliproxy(model_name: str, prompt: str) -> tuple[bool, str]:
+    """Call either Gemini or Codex through the host-local OpenAI-compatible gateway."""
     if not CLIPROXY_KEY:
         return False, "CLIPROXY_API_KEY missing"
-    url = "http://127.0.0.1:8317/v1/chat/completions"
+    url = f"{CLIPROXY_BASE_URL}/chat/completions"
     body = json.dumps({
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}]
@@ -352,65 +357,26 @@ def call_gemini(model_name: str, prompt: str) -> tuple[bool, str]:
         "Content-Type": "application/json"
     })
     try:
-        with urllib.request.urlopen(req, timeout=18) as resp:
+        with urllib.request.urlopen(req, timeout=MODEL_TIMEOUT_SECONDS) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return True, data["choices"][0]["message"]["content"].strip()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+            if not isinstance(content, str) or not content.strip():
+                return False, "empty model response"
+            return True, content.strip()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            detail = str(e.reason)
+        return False, f"HTTP {e.code}: {detail}"
+    except urllib.error.URLError as e:
+        return False, f"network error: {e.reason}"
     except Exception as e:
-        return False, str(e)
-
-def call_codex(prompt: str) -> tuple[bool, str]:
-    try:
-        # Load token directly from auth.json
-        auth_paths = ["/home/yinsheng/.hermes/auth.json", os.path.expanduser("~/.hermes/auth.json")]
-        token = None
-        for p in auth_paths:
-            if os.path.exists(p):
-                try:
-                    with open(p) as f:
-                        auth_data = json.load(f)
-                    pool = auth_data.get("credential_pool", {}).get("openai-codex", [])
-                    if pool and pool[0].get("access_token"):
-                        token = pool[0]["access_token"]
-                        break
-                except Exception:
-                    pass
-        if not token:
-            return False, "No active openai-codex token found in auth.json"
-        
-        url = "https://chatgpt.com/backend-api/codex"
-        body = json.dumps({
-            "model": "gpt-5.6-luna",
-            "messages": [{"role": "user", "content": prompt}]
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "Hermes-NewsMonitor/1.0"
-        })
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return True, data.get("response", data.get("content", str(data))).strip()
-    except Exception as e:
-        return False, str(e)
-
-def call_deepseek(prompt: str) -> tuple[bool, str]:
-    if not DEEPSEEK_KEY:
-        return False, "DEEPSEEK_API_KEY missing"
-    url = "https://api.deepseek.com/chat/completions"
-    body = json.dumps({
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}]
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={
-        "Authorization": f"Bearer {DEEPSEEK_KEY}",
-        "Content-Type": "application/json"
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=18) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return True, data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return False, str(e)
+        return False, f"request error: {e}"
 
 # ----------------- Fallback Alert Notification -----------------
 LAST_FALLBACK_ALERT_TIME = None
@@ -496,13 +462,13 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
 }}
 """
     model_used = None
-    deepseek_only = False
+    fallback_used = False
     result_text = None
     failed_models = []
     error_details = {}
 
-    # Step 1: Primary - Gemini 3.7 Flash High
-    ok, res = call_gemini("gemini-3.7-flash-high", prompt)
+    # Step 1: Primary - Gemini 3.7 Flash High through host CLIProxyAPI
+    ok, res = call_cliproxy(PRIMARY_MODEL, prompt)
     if ok:
         model_used = "Gemini 3.7 Flash High"
         result_text = res
@@ -510,26 +476,15 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
         print(f"[Fallback] Gemini 3.7 Flash failed: {res}")
         failed_models.append("Gemini 3.7 Flash")
         error_details["Gemini 3.7 Flash"] = res
-        # Step 2: Fallback 1 - Gemini 3.1 Pro Low
-        ok, res = call_gemini("gemini-3.1-pro-low", prompt)
+        # Step 2: First and only fallback - Codex GPT Luna through the same gateway
+        ok, res = call_cliproxy(FALLBACK_MODEL, prompt)
         if ok:
-            model_used = "Gemini 3.1 Pro Low"
+            model_used = "GPT-5.6 Luna"
+            fallback_used = True
             result_text = res
         else:
-            print(f"[Fallback] Gemini 3.1 Pro failed: {res}")
-            failed_models.append("Gemini 3.1 Pro")
-            error_details["Gemini 3.1 Pro"] = res
-            # Step 3: Fallback 2 - DeepSeek V4 Flash
-            ok, res = call_deepseek(prompt)
-            if ok:
-                model_used = "DeepSeek V4 Flash"
-                deepseek_only = True
-                result_text = res
-                # Trigger instant out-of-band WeChat alert
-                notify_fallback_alert(failed_models, "DeepSeek V4 Flash", error_details)
-            else:
-                print(f"[Error] All models failed! DeepSeek error: {res}")
-                return {"score": 0, "error": "all_models_failed"}
+            print(f"[Error] Both configured models failed! GPT Luna error: {res}")
+            return {"score": 0, "error": "all_models_failed"}
 
     # Extract JSON
     try:
@@ -538,7 +493,7 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
             clean_json = clean_json[clean_json.find("{"):clean_json.rfind("}")+1]
         data = json.loads(clean_json.strip())
         data["model_used"] = model_used
-        data["deepseek_only_notice"] = deepseek_only
+        data["fallback_used"] = fallback_used
         return data
     except Exception as e:
         print(f"[Parse Error] Failed to parse model output: {e}\nRaw output: {result_text}")
@@ -583,10 +538,6 @@ def format_wechat_card(news_meta: dict, analysis: dict) -> str:
 {summary}
 
 来源：{source}（{time_display}）"""
-
-    # Check for DeepSeek-only notice at end of news card
-    if analysis.get("deepseek_only_notice"):
-        msg += "\n\n⚠️ 【系统附注】上游主模型当前不可用，已自动切换至 DeepSeek 兜底研判。"
 
     return msg
 
@@ -897,6 +848,7 @@ def main():
     print(f"Database: {DB_PATH}")
     print(f"Poll Interval: {POLL_INTERVAL_SECONDS}s")
     print(f"Heartbeat Path: {HEARTBEAT_PATH}")
+    print(f"Model Chain: {PRIMARY_MODEL} -> {FALLBACK_MODEL} (via {CLIPROXY_BASE_URL})")
     cycle_count = 0
     while True:
         try:

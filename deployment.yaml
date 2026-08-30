@@ -62,6 +62,14 @@ spec:
           value: /tmp/news_monitor_heartbeat
         - name: HERMES_HOME
           value: /data/hermes
+        - name: CLIPROXY_BASE_URL
+          value: http://127.0.0.1:8317/v1
+        - name: PRIMARY_MODEL
+          value: gemini-3.7-flash-high
+        - name: FALLBACK_MODEL
+          value: gpt-5.6-luna
+        - name: MODEL_TIMEOUT_SECONDS
+          value: "25"
         - name: WEIXIN_RECEIVER
           value: o9cq80-itgP5_UnL3cyqo9gv9JBg@im.wechat
         - name: CLIPROXY_API_KEY
@@ -69,11 +77,6 @@ spec:
             secretKeyRef:
               name: news-monitor-secrets
               key: CLIPROXY_API_KEY
-        - name: DEEPSEEK_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: news-monitor-secrets
-              key: DEEPSEEK_API_KEY
         livenessProbe:
           exec:
             command:
