@@ -233,9 +233,10 @@ def _state_set(key: str, value: str) -> None:
         )
 
 
-def _split_hard(text: str) -> list[str]:
+def _split_hard(text: str, limit: int | None = None) -> list[str]:
     """Final safety valve for an unbreakable token or malformed model output."""
-    return [text[index : index + MESSAGE_LIMIT] for index in range(0, len(text), MESSAGE_LIMIT)]
+    chunk_size = limit or MESSAGE_LIMIT
+    return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)]
 
 
 def _split_code_block(block: str) -> list[str]:
@@ -256,7 +257,7 @@ def _split_code_block(block: str) -> list[str]:
     body_chunks: list[str] = []
     current = ""
     for line in lines[1:-1]:
-        pieces = _split_hard(line) if len(line) > budget else [line]
+        pieces = _split_hard(line, budget) if len(line) > budget else [line]
         for piece in pieces:
             candidate = f"{current}\n{piece}" if current else piece
             if len(candidate) <= budget:

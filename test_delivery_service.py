@@ -54,6 +54,12 @@ class DeliveryServiceTests(unittest.TestCase):
         self.assertTrue(all(len(message) <= 120 for message in messages))
         self.assertTrue(all(message.startswith("```java\n") and message.endswith("\n```") for message in messages))
 
+    def test_long_code_line_is_split_within_the_fence_budget(self):
+        oversized = "```text\n" + ("x" * 200) + "\n```"
+        messages = self.service.semantic_split(oversized)
+        self.assertTrue(all(len(message) <= 120 for message in messages))
+        self.assertTrue(all(message.startswith("```text\n") and message.endswith("\n```") for message in messages))
+
 
 if __name__ == "__main__":
     unittest.main()
