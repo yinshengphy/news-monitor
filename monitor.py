@@ -10,7 +10,6 @@ Global Breaking News Monitoring Service (Production Grade v2)
 """
 
 import os
-import sys
 import time
 import json
 import sqlite3
@@ -33,8 +32,11 @@ CLIPROXY_BASE_URL = os.environ.get("CLIPROXY_BASE_URL", "http://127.0.0.1:8317/v
 PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "gemini-3.7-flash-high")
 FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-5.6-luna")
 MODEL_TIMEOUT_SECONDS = int(os.environ.get("MODEL_TIMEOUT_SECONDS", "25"))
-TARGET_WEIXIN = os.environ.get("WEIXIN_RECEIVER", "o9cq80-itgP5_UnL3cyqo9gv9JBg@im.wechat")
 HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", "/tmp/news_monitor_heartbeat")
+DELIVERY_QUEUE_URL = os.environ.get(
+    "DELIVERY_QUEUE_URL", "http://127.0.0.1:8787/v1/deliveries"
+)
+DELIVERY_QUEUE_TOKEN = os.environ.get("DELIVERY_QUEUE_TOKEN", "")
 
 # News Sources Definition
 SOURCES = {
@@ -450,8 +452,14 @@ def flush_pending_model_alert():
     message = get_system_state(MODEL_ALERT_PENDING_KEY)
     if not message:
         return
-    print("[MODEL ALERT] Sending queued model interface status notification...", flush=True)
-    ok, err = send_weixin_direct_call(message)
+    print("[MODEL ALERT] Enqueuing model interface status notification...", flush=True)
+    alert_key = "model-alert:" + hashlib.sha256(message.encode("utf-8")).hexdigest()[:24]
+    ok, err = enqueue_delivery(
+        messages=[message],
+        idempotency_key=alert_key,
+        category="model-alert",
+        priority=90,
+    )
     if not ok:
         print(f"[MODEL ALERT Error] Delivery failed and will retry: {err}", flush=True)
         return
@@ -460,7 +468,7 @@ def flush_pending_model_alert():
         conn.execute("DELETE FROM system_state WHERE key = ?", (MODEL_ALERT_PENDING_KEY,))
         conn.commit()
         conn.close()
-        print("[MODEL ALERT] Notification delivered successfully.", flush=True)
+        print("[MODEL ALERT] Notification accepted by delivery queue.", flush=True)
     except Exception as e:
         print(f"[State Warning] Alert sent but pending state cleanup failed: {e}", flush=True)
 
@@ -655,33 +663,45 @@ def format_wechat_card(news_meta: dict, analysis: dict) -> str:
 
     return msg
 
-def send_weixin_direct_call(message: str) -> tuple[bool, str]:
+def enqueue_delivery(
+    *,
+    messages: list[str],
+    idempotency_key: str,
+    category: str,
+    priority: int = 50,
+) -> tuple[bool, str]:
+    """Submit complete WeChat message modules to the persistent sender queue."""
+    if not DELIVERY_QUEUE_TOKEN:
+        return False, "DELIVERY_QUEUE_TOKEN missing"
+    payload = json.dumps({
+        "idempotency_key": idempotency_key,
+        "category": category,
+        "priority": priority,
+        "messages": messages,
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        DELIVERY_QUEUE_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {DELIVERY_QUEUE_TOKEN}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
     try:
-        import asyncio
-        sys.path.insert(0, "/opt/hermes-src")
-        
-        token = os.environ.get("WEIXIN_TOKEN", "")
-        env_path = "/home/yinsheng/.hermes/.env"
-        if not token and os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.strip().startswith("WEIXIN_TOKEN="):
-                        token = line.strip().split("=", 1)[1].strip("\"'")
-                        
-        extra = {"account_id": "DEFAULT"}
-        from gateway.platforms.weixin import send_weixin_direct
-        
-        res = asyncio.run(send_weixin_direct(
-            extra=extra,
-            token=token,
-            chat_id=TARGET_WEIXIN,
-            message=message
-        ))
-        if res.get("success"):
-            return True, "success"
-        return False, str(res.get("error", "unknown_error"))
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("accepted") or result.get("duplicate"):
+                return True, "accepted"
+            return False, str(result)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = str(e.reason)
+        return False, f"queue HTTP {e.code}: {detail}"
     except Exception as e:
-        return False, str(e)
+        return False, f"queue error: {e}"
 
 def flush_outbox():
     conn = sqlite3.connect(DB_PATH)
@@ -714,14 +734,19 @@ def flush_outbox():
             except Exception:
                 pass
 
-        print(f"\n[PUSH QUEUE] Attempting delivery (retry #{retry_cnt}): {title[:40]}...", flush=True)
-        ok, err = send_weixin_direct_call(msg)
+        print(f"\n[PUSH QUEUE] Enqueuing delivery (retry #{retry_cnt}): {title[:40]}...", flush=True)
+        ok, err = enqueue_delivery(
+            messages=[msg],
+            idempotency_key=f"breaking:{item_hash}",
+            category="breaking-news",
+            priority=100,
+        )
         
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         now_str = datetime.now(timezone.utc).isoformat()
         if ok:
-            print(f"[PUSH SUCCESS] Alert delivered successfully: {title[:40]}", flush=True)
+            print(f"[PUSH SUCCESS] Alert accepted by delivery queue: {title[:40]}", flush=True)
             cur.execute("""
             UPDATE processed_items
             SET push_status = 2, is_pushed = 1, last_retry_at = ?
