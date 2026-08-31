@@ -24,7 +24,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ----------------- Configuration -----------------
 DB_PATH = os.environ.get("NEWS_DB_PATH", "/data/news.db")
-HERMES_HOME = os.environ.get("HERMES_HOME", "/home/yinsheng/.hermes")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "180"))
 HTTP_PROXY = os.environ.get("HTTP_PROXY", "http://127.0.0.1:7890")
 CLIPROXY_KEY = os.environ.get("CLIPROXY_API_KEY", "")
