@@ -41,10 +41,18 @@ class DeliveryServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]["body"], "完整消息")
         self.assertTrue(rows[0]["client_id"].startswith("hermes-q-"))
 
-    def test_code_block_is_never_cut(self):
-        oversized = "```java\n" + ("a" * 150) + "\n```"
-        with self.assertRaises(ValueError):
-            self.service.semantic_split(oversized)
+    def test_oversized_marked_module_is_split_instead_of_failing(self):
+        oversized = "[[MESSAGE]]\n" + ("这是一个完整段落。" * 30)
+        messages = self.service.semantic_split(oversized)
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(message) <= 120 for message in messages))
+
+    def test_oversized_code_block_is_split_into_valid_fences(self):
+        oversized = "```java\n" + ("a\n" * 100) + "```"
+        messages = self.service.semantic_split(oversized)
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(message) <= 120 for message in messages))
+        self.assertTrue(all(message.startswith("```java\n") and message.endswith("\n```") for message in messages))
 
 
 if __name__ == "__main__":

@@ -233,29 +233,127 @@ def _state_set(key: str, value: str) -> None:
         )
 
 
+def _split_hard(text: str) -> list[str]:
+    """Final safety valve for an unbreakable token or malformed model output."""
+    return [text[index : index + MESSAGE_LIMIT] for index in range(0, len(text), MESSAGE_LIMIT)]
+
+
+def _split_code_block(block: str) -> list[str]:
+    """Split a long fenced block into independently valid fenced snippets."""
+    if len(block) <= MESSAGE_LIMIT:
+        return [block]
+
+    lines = block.splitlines()
+    if len(lines) < 2 or not lines[0].lstrip().startswith("```") or not lines[-1].strip().startswith("```"):
+        return _split_hard(block)
+
+    opening = lines[0].strip()
+    closing = "```"
+    budget = MESSAGE_LIMIT - len(opening) - len(closing) - 2
+    if budget <= 0:
+        return _split_hard(block)
+
+    body_chunks: list[str] = []
+    current = ""
+    for line in lines[1:-1]:
+        pieces = _split_hard(line) if len(line) > budget else [line]
+        for piece in pieces:
+            candidate = f"{current}\n{piece}" if current else piece
+            if len(candidate) <= budget:
+                current = candidate
+            else:
+                body_chunks.append(current)
+                current = piece
+    if current:
+        body_chunks.append(current)
+
+    return [f"{opening}\n{body}\n{closing}" for body in body_chunks] or [f"{opening}\n{closing}"]
+
+
+def _split_prose(text: str) -> list[str]:
+    """Split prose at paragraphs/sentences, then hard-split only as a last resort."""
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    units: list[str] = []
+    for paragraph in paragraphs:
+        if len(paragraph) <= MESSAGE_LIMIT:
+            units.append(paragraph)
+            continue
+
+        sentences = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？.!?；;])\s*|\n", paragraph)
+            if part.strip()
+        ]
+        if not sentences:
+            sentences = [paragraph]
+        for sentence in sentences:
+            units.extend(_split_hard(sentence) if len(sentence) > MESSAGE_LIMIT else [sentence])
+    return units
+
+
+def _markdown_units(text: str) -> list[tuple[str, str]]:
+    """Return prose and complete fenced-code units without cutting fences."""
+    lines = text.splitlines(keepends=True)
+    units: list[tuple[str, str]] = []
+    prose: list[str] = []
+    code: list[str] | None = None
+
+    def flush_prose() -> None:
+        if prose:
+            units.append(("prose", "".join(prose)))
+            prose.clear()
+
+    for line in lines:
+        if code is None and line.lstrip().startswith("```"):
+            flush_prose()
+            code = [line]
+            continue
+        if code is not None:
+            code.append(line)
+            if len(code) > 1 and line.strip().startswith("```"):
+                units.append(("code", "".join(code).strip()))
+                code = None
+            continue
+        prose.append(line)
+
+    if code is not None:
+        # A malformed fence is treated as prose so it can never block delivery.
+        prose.extend(code)
+    flush_prose()
+    return units
+
+
 def _split_oversized_text(text: str) -> list[str]:
-    """Last-resort sentence split; scheduled prompts normally avoid this path."""
+    """Split text safely while keeping prose paragraphs and fenced code valid."""
     if len(text) <= MESSAGE_LIMIT:
         return [text]
-    if "```" in text:
-        raise ValueError("an indivisible code block exceeds the WeChat message limit")
-    sentences = [p.strip() for p in re.split(r"(?<=[。！？.!?])\s*", text) if p.strip()]
-    if len(sentences) <= 1:
-        raise ValueError("an indivisible content module exceeds the WeChat message limit")
+
+    units: list[str] = []
+    for kind, value in _markdown_units(text):
+        if kind == "code":
+            units.extend(_split_code_block(value))
+        else:
+            units.extend(_split_prose(value))
+
     result: list[str] = []
     current = ""
-    for sentence in sentences:
-        if len(sentence) > MESSAGE_LIMIT:
-            raise ValueError("an indivisible sentence exceeds the WeChat message limit")
-        candidate = f"{current}{sentence}" if current else sentence
+    for unit in units:
+        if len(unit) > MESSAGE_LIMIT:
+            if current:
+                result.append(current)
+                current = ""
+            result.extend(_split_hard(unit))
+            continue
+        candidate = f"{current}\n\n{unit}" if current else unit
         if len(candidate) <= MESSAGE_LIMIT:
             current = candidate
         else:
-            result.append(current)
-            current = sentence
+            if current:
+                result.append(current)
+            current = unit
     if current:
         result.append(current)
-    return result
+    return result or _split_hard(text)
 
 
 def semantic_split(content: str) -> list[str]:
@@ -713,13 +811,11 @@ def call_model_chain(prompt: str) -> tuple[str, str]:
 def _require_marked_messages(result: str) -> list[str]:
     if "[[MESSAGE]]" not in result:
         raise ValueError("model output omitted [[MESSAGE]] boundaries")
-    messages = [
-        part.strip()
-        for part in re.split(r"(?m)^\s*\[\[MESSAGE\]\]\s*$", result)
-        if part.strip()
-    ]
-    if not messages or any(len(message) > MESSAGE_LIMIT for message in messages):
-        raise ValueError("model output contains an oversized message module")
+    # The model's boundaries are preferred, but an oversized module is a
+    # formatting issue, not a reason to discard the whole scheduled job.
+    messages = semantic_split(result)
+    if not messages:
+        raise ValueError("model output contains no message content")
     return messages
 
 
