@@ -670,7 +670,8 @@ def _call_model(model: str, prompt: str) -> tuple[bool, str]:
 
 
 def _model_alert(title: str, lines: list[str]) -> None:
-    body = title + "\n───────────────────────\n" + "\n".join(f"• {line}" for line in lines)
+    # 与实时新闻监控保持一致：微信提醒只保留一条完整状态消息。
+    body = title
     fingerprint = hashlib.sha256(body.encode()).hexdigest()[:20]
     enqueue_delivery(f"content-model:{fingerprint}", "model-alert", [body], 90)
 
@@ -683,8 +684,8 @@ def call_model_chain(prompt: str) -> tuple[str, str]:
         _state_set("content_primary_health", "healthy")
         if previous_primary == "unhealthy":
             _model_alert(
-                "✅ 内容服务模型恢复｜主模型已恢复",
-                [f"{PRIMARY_MODEL} 已恢复，内容生成自动切回主模型。"],
+                f"✅ 已恢复主模型｜`{PRIMARY_MODEL}`",
+                [],
             )
         return result, PRIMARY_MODEL
 
@@ -695,19 +696,16 @@ def call_model_chain(prompt: str) -> tuple[str, str]:
         _state_set("content_fallback_health", "healthy")
         if previous_primary != "unhealthy" or previous_fallback == "unhealthy":
             _model_alert(
-                "⚠️ 内容服务模型切换｜备用模型接管",
-                [
-                    f"主模型 {PRIMARY_MODEL} 调用失败。",
-                    f"备用模型 {FALLBACK_MODEL} 已成功接管。",
-                ],
+                f"⚠️ 已切备用｜`{FALLBACK_MODEL}`",
+                [],
             )
         return result, FALLBACK_MODEL
 
     _state_set("content_fallback_health", "unhealthy")
     if previous_primary != "unhealthy" or previous_fallback != "unhealthy":
         _model_alert(
-            "🚨 内容服务模型故障｜主备均失败",
-            [f"{PRIMARY_MODEL} 与 {FALLBACK_MODEL} 当前均不可用。"],
+            "🚨 主备均不可用｜本轮终止",
+            [],
         )
     raise RuntimeError(f"both models failed: primary={primary_error[:120]}; fallback={result[:120]}")
 

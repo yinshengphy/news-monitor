@@ -416,15 +416,8 @@ def _short_model_error(error: str) -> str:
 
 
 def _build_model_alert(title: str, details: list[str]) -> str:
-    bj_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    detail_text = "\n".join(f"• {line}" for line in details)
-    return f"""{title}
-───────────────────────
-时间：{bj_time}
-{detail_text}
-
-调用顺序：{PRIMARY_MODEL} → {FALLBACK_MODEL}
-说明：仅在模型接口状态发生变化时提醒，不会重复发送相同故障。"""
+    # 状态提醒保持为单行短消息，避免微信折叠或拆分后丢失关键信息。
+    return title
 
 
 def _save_model_health_and_alert(primary_state: str, fallback_state: str, alert_message: str = ""):
@@ -489,11 +482,8 @@ def record_model_outcome(
     if primary_ok:
         if previous_primary == "unhealthy":
             alert_message = _build_model_alert(
-                "✅ 模型接口恢复提醒｜主模型已恢复",
-                [
-                    f"主模型 {PRIMARY_MODEL} 已恢复正常，后续研判已自动切回主模型。",
-                    f"备用模型 {FALLBACK_MODEL} 保持待命。",
-                ],
+                f"✅ 已恢复主模型｜`{PRIMARY_MODEL}`",
+                [],
             )
     elif fallback_attempted and fallback_ok is True:
         new_fallback = "healthy"
@@ -507,9 +497,7 @@ def record_model_outcome(
             details.append(f"备用模型 {FALLBACK_MODEL} 已恢复正常。")
         if details:
             title = (
-                "✅ 模型接口恢复提醒｜备用模型已恢复并接管"
-                if previous_primary == "unhealthy" and previous_fallback == "unhealthy"
-                else "⚠️ 模型接口切换提醒｜主模型已切换至备用"
+                f"⚠️ 已切备用｜`{FALLBACK_MODEL}`"
             )
             alert_message = _build_model_alert(title, details)
     elif fallback_attempted and fallback_ok is False:
@@ -520,12 +508,7 @@ def record_model_outcome(
                 details.append(f"主模型 {PRIMARY_MODEL} 调用失败：{_short_model_error(primary_error)}")
             details.append(f"备用模型 {FALLBACK_MODEL} 调用失败：{_short_model_error(fallback_error)}")
             details.append("主、备用模型当前均不可用，本轮新闻研判已安全终止，不会推送未研判内容。")
-            title = (
-                "🚨 模型接口故障提醒｜主备模型均失败"
-                if previous_primary != "unhealthy"
-                else "🚨 模型接口故障提醒｜备用模型也已失败"
-            )
-            alert_message = _build_model_alert(title, details)
+            alert_message = _build_model_alert("🚨 主备均不可用｜本轮终止", details)
 
     _save_model_health_and_alert(new_primary, new_fallback, alert_message)
     flush_pending_model_alert()
