@@ -1239,18 +1239,23 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
         
         # Build rolling markdown body
         trend_sections = []
-        seen_fps = set()
+        seen_titles = set()
         count = 1
         for row in recent_rows:
-            fp = row[0]
-            if fp in seen_fps:
+            title = row[1]
+            norm_title = re.sub(r"\W+", "", (title or "").lower())
+            if norm_title in seen_titles:
                 continue
-            seen_fps.add(fp)
+            seen_titles.add(norm_title)
             if row[3]:
                 try:
                     item_data = json.loads(row[3])
+                    item_title = item_data.get("title", "")
+                    norm_item_title = re.sub(r"\W+", "", item_title.lower())
+                    if norm_item_title:
+                        seen_titles.add(norm_item_title)
                     trend_sections.append(
-                        f"### 🔥 {count}｜{item_data.get('title', '')}\n"
+                        f"### 🔥 {count}｜{item_title}\n"
                         f"- **为什么热**：{item_data.get('why_hot', '')}\n"
                         f"- **已核实事实**：{item_data.get('facts', '')}\n"
                         f"- **影响/关注**：{item_data.get('impact', '')}\n"
@@ -1262,17 +1267,19 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
         
         # Also include currently selected items if not yet queried
         for item in valid:
-            fp = item.get("fingerprint")
-            if fp and fp not in seen_fps:
-                seen_fps.add(fp)
-                trend_sections.append(
-                    f"### 🔥 {count}｜{item.get('title', '')}\n"
-                    f"- **为什么热**：{item.get('why_hot', '')}\n"
-                    f"- **已核实事实**：{item.get('facts', '')}\n"
-                    f"- **影响/关注**：{item.get('impact', '')}\n"
-                    f"- **来源**：{'、'.join(str(s) for s in item.get('sources', [])[:3])}"
-                )
-                count += 1
+            item_title = item.get("title", "")
+            norm_title = re.sub(r"\W+", "", item_title.lower())
+            if norm_title in seen_titles:
+                continue
+            seen_titles.add(norm_title)
+            trend_sections.append(
+                f"### 🔥 {count}｜{item_title}\n"
+                f"- **为什么热**：{item.get('why_hot', '')}\n"
+                f"- **已核实事实**：{item.get('facts', '')}\n"
+                f"- **影响/关注**：{item.get('impact', '')}\n"
+                f"- **来源**：{'、'.join(str(s) for s in item.get('sources', [])[:3])}"
+            )
+            count += 1
 
         body_content = (
             "> 本文展示过去 12 小时内全球热议焦点与多源交叉核验结果。系统每 2 小时滚动更新，自动保留最新动态。\n\n"
