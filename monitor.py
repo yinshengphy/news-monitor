@@ -177,6 +177,8 @@ def init_db():
         cur.execute("ALTER TABLE processed_items ADD COLUMN blog_retry_count INTEGER DEFAULT 0")
     if "blog_last_retry_at" not in columns:
         cur.execute("ALTER TABLE processed_items ADD COLUMN blog_last_retry_at TEXT")
+    if "breaking_title" not in columns:
+        cur.execute("ALTER TABLE processed_items ADD COLUMN breaking_title TEXT")
     if "breaking_summary" not in columns:
         cur.execute("ALTER TABLE processed_items ADD COLUMN breaking_summary TEXT")
     if "breaking_level" not in columns:
@@ -214,22 +216,23 @@ def is_item_processed(item_hash: str) -> bool:
     return row is not None
 
 def record_item(item_hash: str, source: str, title: str, link: str, published_at: str, 
-                score: int, is_pushed: int, push_status: int = 0, incident_key: str = None,
-                wechat_msg: str = None, breaking_summary: str = None, breaking_level: str = None):
+                score: int, is_pushed: int, push_status: int = 0, incident_key: str | None = None,
+                wechat_msg: str | None = None, breaking_title: str | None = None, breaking_summary: str | None = None, breaking_level: str | None = None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     now_str = datetime.now(timezone.utc).isoformat()
     cur.execute("""
-    INSERT INTO processed_items (hash, source, title, link, published_at, discovered_at, score, is_pushed, push_status, retry_count, last_retry_at, incident_key, wechat_msg, blog_status, blog_retry_count, blog_last_retry_at, breaking_summary, breaking_level)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, NULL, ?, ?)
+    INSERT INTO processed_items (hash, source, title, link, published_at, discovered_at, score, is_pushed, push_status, retry_count, last_retry_at, incident_key, wechat_msg, blog_status, blog_retry_count, blog_last_retry_at, breaking_title, breaking_summary, breaking_level)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, NULL, ?, ?, ?)
     ON CONFLICT(hash) DO UPDATE SET
         score=excluded.score,
         push_status=excluded.push_status,
         incident_key=excluded.incident_key,
         wechat_msg=excluded.wechat_msg,
+        breaking_title=excluded.breaking_title,
         breaking_summary=excluded.breaking_summary,
         breaking_level=excluded.breaking_level
-    """, (item_hash, source, title, link, published_at, now_str, score, is_pushed, push_status, incident_key, wechat_msg, breaking_summary, breaking_level))
+    """, (item_hash, source, title, link, published_at, now_str, score, is_pushed, push_status, incident_key, wechat_msg, breaking_title, breaking_summary, breaking_level))
     conn.commit()
     conn.close()
 
@@ -565,6 +568,7 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
   "verified_status": "海外主流媒体首发·待官方通报 / 官方权威已确认 / 多源已证实",
   "location": "西藏日喀则吉隆县",
   "time_str": "发生时间（若已知）",
+  "chinese_title": "精炼有力的中文快讯主标题（若原标题为英文必须准确翻译为纯中文，20-40字）",
   "core_facts": "核心事实一句话说明",
   "impact": "人员伤亡、交通/基础设施或区域影响",
   "summary": "100字左右的高信息密度中文精炼摘要"
@@ -620,7 +624,8 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
 
 # ----------------- WeChat Formatter & Outbox Dispatcher -----------------
 def format_wechat_card(news_meta: dict, analysis: dict) -> str:
-    title = news_meta.get("title", "")
+    raw_title = news_meta.get("title", "")
+    chinese_title = analysis.get("chinese_title") or analysis.get("core_facts") or raw_title
     source = news_meta.get("source", "未知信源")
     
     score = analysis.get("score", 0)
@@ -628,7 +633,7 @@ def format_wechat_card(news_meta: dict, analysis: dict) -> str:
     status = analysis.get("verified_status", "待核实")
     location = analysis.get("location", "未知")
     time_str = analysis.get("time_str", "")
-    core_facts = analysis.get("core_facts", title)
+    core_facts = analysis.get("core_facts", chinese_title)
     impact = analysis.get("impact", "尚在评估中")
     summary = analysis.get("summary", "")
     
@@ -642,6 +647,7 @@ def format_wechat_card(news_meta: dict, analysis: dict) -> str:
 
     msg = f"""🚨 全球重大突发快讯｜{level}
 ───────────────────────
+【事件标题】{chinese_title}
 【事件地点】{location}
 【发生时间】{event_time}
 【评估等级】{score} / 100（重大突发）
@@ -705,11 +711,12 @@ def enqueue_breaking_blog_publication(row: tuple) -> tuple[bool, str]:
     """Store a three-day breaking-news update in blog-service's durable outbox."""
     if not BLOG_PUBLICATION_BASE_URL or not BLOG_PUBLICATION_TOKEN:
         return False, "BLOG_PUBLICATION_TOKEN missing"
-    item_hash, source, title, link, discovered_at, summary, level = row
+    item_hash, source, title, link, discovered_at, breaking_title, summary, level = row
+    final_title = (breaking_title or title)[:220]
     payload = json.dumps({
         "idempotencyKey": f"breaking:{item_hash}",
         "fingerprint": item_hash,
-        "title": title[:220],
+        "title": final_title,
         "summary": (summary or title)[:600],
         "source": source[:100],
         "discoveredAt": discovered_at,
@@ -742,7 +749,7 @@ def flush_breaking_blog_outbox():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-    SELECT hash, source, title, link, discovered_at, breaking_summary, breaking_level,
+    SELECT hash, source, title, link, discovered_at, breaking_title, breaking_summary, breaking_level,
            blog_retry_count, blog_last_retry_at
     FROM processed_items
     WHERE push_status IN (1, 2) AND COALESCE(blog_status, 0) != 2
@@ -754,7 +761,7 @@ def flush_breaking_blog_outbox():
 
     now_utc = datetime.now(timezone.utc)
     for row in pending:
-        item_hash, source, title, link, discovered_at, summary, level, retry_cnt, last_retry_str = row
+        item_hash, source, title, link, discovered_at, breaking_title, summary, level, retry_cnt, last_retry_str = row
         if last_retry_str:
             try:
                 last_retry_dt = datetime.fromisoformat(last_retry_str)
@@ -765,7 +772,7 @@ def flush_breaking_blog_outbox():
                 pass
 
         ok, err = enqueue_breaking_blog_publication(
-            (item_hash, source, title, link, discovered_at, summary, level)
+            (item_hash, source, title, link, discovered_at, breaking_title, summary, level)
         )
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -1051,9 +1058,11 @@ def poll_all():
             if should_push:
                 print(f" -> [PUSH ACCEPTED] Incident '{incident_key}': {reason}", flush=True)
                 msg_card = format_wechat_card(item, analysis)
+                chinese_title = analysis.get("chinese_title") or analysis.get("core_facts") or title
                 record_item(item["hash"], source, title, item["link"], item["published_at"],
                             score=score, is_pushed=0, push_status=1, incident_key=incident_key,
-                            wechat_msg=msg_card, breaking_summary=analysis.get("summary", ""),
+                            wechat_msg=msg_card, breaking_title=chinese_title,
+                            breaking_summary=analysis.get("summary", ""),
                             breaking_level=level)
             else:
                 print(f" -> [PUSH SUPPRESSED] Incident '{incident_key}': {reason}", flush=True)
