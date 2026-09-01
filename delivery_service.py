@@ -192,7 +192,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS trend_pushes (
                 fingerprint TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
-                pushed_at TEXT NOT NULL
+                pushed_at TEXT NOT NULL,
+                data TEXT
             );
             CREATE TABLE IF NOT EXISTS system_state (
                 key TEXT PRIMARY KEY,
@@ -1217,20 +1218,67 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
     messages.append(current)
     queued = enqueue_delivery(run_key, "global-trends", messages, 45)
     
-    # Also publish to Blog
+    # Also publish/update to Blog single trending post
     try:
-        date_str = now.strftime("%Y-%m-%d")
-        hour_tag = run_key.split("T")[-1] if "T" in run_key else ""
-        slug_key = run_key.replace(":", "-").replace("_", "-").lower()
+        with db_connect() as conn:
+            # Fetch all active trend items within the last 12 hours
+            twelve_hours_ago = (utc_now() - timedelta(hours=12)).isoformat()
+            recent_rows = conn.execute(
+                "SELECT fingerprint, title, pushed_at, data FROM trend_pushes WHERE pushed_at>=? ORDER BY pushed_at DESC",
+                (twelve_hours_ago,),
+            ).fetchall()
+        
+        # Build rolling markdown body
+        trend_sections = []
+        seen_fps = set()
+        count = 1
+        for row in recent_rows:
+            fp = row[0]
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+            if row[3]:
+                try:
+                    item_data = json.loads(row[3])
+                    trend_sections.append(
+                        f"### 🔥 {count}｜{item_data.get('title', '')}\n"
+                        f"- **为什么热**：{item_data.get('why_hot', '')}\n"
+                        f"- **已核实事实**：{item_data.get('facts', '')}\n"
+                        f"- **影响/关注**：{item_data.get('impact', '')}\n"
+                        f"- **来源**：{'、'.join(str(s) for s in item_data.get('sources', [])[:3])}"
+                    )
+                    count += 1
+                except Exception:
+                    pass
+        
+        # Also include currently selected items if not yet queried
+        for item in valid:
+            fp = item.get("fingerprint")
+            if fp and fp not in seen_fps:
+                seen_fps.add(fp)
+                trend_sections.append(
+                    f"### 🔥 {count}｜{item.get('title', '')}\n"
+                    f"- **为什么热**：{item.get('why_hot', '')}\n"
+                    f"- **已核实事实**：{item.get('facts', '')}\n"
+                    f"- **影响/关注**：{item.get('impact', '')}\n"
+                    f"- **来源**：{'、'.join(str(s) for s in item.get('sources', [])[:3])}"
+                )
+                count += 1
+
+        body_content = (
+            "> 本文展示过去 12 小时内全球热议焦点与多源交叉核验结果。系统每 2 小时滚动更新，自动保留最新动态。\n\n"
+            + "\n\n---\n\n".join(trend_sections)
+        )
+
         publish_scheduled_post(
-            idempotency_key=f"blog:{run_key}",
-            slug=f"global-trends-{slug_key}",
-            title=f"全球热议观察（{date_str} {hour_tag}:00）",
+            idempotency_key=f"blog:global-trending:{now.strftime('%Y%m%d%H')}",
+            slug="global-trending",
+            title="全球热议观察（近12小时动态）",
             now=now,
-            description=f"全球热议观察与事实交叉核验简报（{date_str} {hour_tag}:00）。",
-            categories=["Global Trends", "News"],
-            tags=["全球热议", "趋势观察", "新闻核验"],
-            messages=messages,
+            description="过去12小时内全球热议焦点与事实交叉核验简报（持续滚动更新）。",
+            categories=["TRENDING"],
+            tags=["全球热议", "趋势观察", "新闻核验", "TRENDING"],
+            messages=[body_content],
         )
     except Exception as exc:
         print(f"[TrendsBlogError] Failed to submit to blog outbox: {exc}")
@@ -1238,8 +1286,11 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
     with db_connect() as conn:
         for item in valid:
             conn.execute(
-                "INSERT OR IGNORE INTO trend_pushes(fingerprint,title,pushed_at) VALUES(?,?,?)",
-                (item["fingerprint"], str(item.get("title", ""))[:200], iso_now()),
+                """
+                INSERT INTO trend_pushes(fingerprint,title,pushed_at,data) VALUES(?,?,?,?)
+                ON CONFLICT(fingerprint) DO UPDATE SET title=excluded.title, pushed_at=excluded.pushed_at, data=excluded.data
+                """,
+                (item["fingerprint"], str(item.get("title", ""))[:200], iso_now(), json.dumps(item, ensure_ascii=False)),
             )
     queued["model"] = model
     queued["topics"] = len(valid)
