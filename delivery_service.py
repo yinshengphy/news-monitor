@@ -1216,6 +1216,25 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
             current = f"🌐 全球热议观察（续）\n\n{atom}"
     messages.append(current)
     queued = enqueue_delivery(run_key, "global-trends", messages, 45)
+    
+    # Also publish to Blog
+    try:
+        date_str = now.strftime("%Y-%m-%d")
+        hour_tag = run_key.split("T")[-1] if "T" in run_key else ""
+        slug_key = run_key.replace(":", "-").replace("_", "-").lower()
+        publish_scheduled_post(
+            idempotency_key=f"blog:{run_key}",
+            slug=f"global-trends-{slug_key}",
+            title=f"全球热议观察（{date_str} {hour_tag}:00）",
+            now=now,
+            description=f"全球热议观察与事实交叉核验简报（{date_str} {hour_tag}:00）。",
+            categories=["Global Trends", "News"],
+            tags=["全球热议", "趋势观察", "新闻核验"],
+            messages=messages,
+        )
+    except Exception as exc:
+        print(f"[TrendsBlogError] Failed to submit to blog outbox: {exc}")
+
     with db_connect() as conn:
         for item in valid:
             conn.execute(
