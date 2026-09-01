@@ -500,6 +500,31 @@ def publish_scheduled_post(
     return result
 
 
+def _get_active_context_token(receiver: str) -> str | None:
+    # 1. Try ContextTokenStore standard load
+    try:
+        from gateway.platforms.weixin import ContextTokenStore
+        store = ContextTokenStore(HERMES_HOME)
+        for acc in ["DEFAULT", "419076e9d700@im.bot", "default"]:
+            store.restore(acc)
+            tok = store.get(acc, receiver)
+            if tok:
+                return tok
+    except Exception:
+        pass
+    # 2. Search direct JSON token files in ~/.hermes/weixin/accounts/
+    accounts_dir = Path(HERMES_HOME) / "weixin" / "accounts"
+    if accounts_dir.is_dir():
+        for tf in accounts_dir.glob("*.context-tokens.json"):
+            try:
+                data = json.loads(tf.read_text(encoding="utf-8"))
+                if receiver in data:
+                    return data[receiver]
+            except Exception:
+                pass
+    return None
+
+
 def _load_weixin_token() -> str:
     if WEIXIN_TOKEN:
         return WEIXIN_TOKEN
@@ -532,9 +557,7 @@ async def _send_weixin_raw(body: str, client_id: str) -> tuple[bool, str]:
         return False, "permanent:WeChat credentials are incomplete"
     account_id = os.environ.get("WEIXIN_ACCOUNT_ID", "DEFAULT")
     base_url = os.environ.get("WEIXIN_BASE_URL", ILINK_BASE_URL).rstrip("/")
-    store = ContextTokenStore(HERMES_HOME)
-    store.restore(account_id)
-    context_token = store.get(account_id, WEIXIN_RECEIVER)
+    context_token = _get_active_context_token(WEIXIN_RECEIVER)
 
     try:
         async with aiohttp.ClientSession(
