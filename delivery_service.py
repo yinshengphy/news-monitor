@@ -1149,8 +1149,9 @@ def _trend_daily_count(now: datetime) -> int:
 
 def generate_trend_digest(run_key: str) -> dict[str, Any]:
     now = datetime.now(TZ)
-    if _trend_daily_count(now) >= 3:
-        return {"skipped": True, "reason": "daily digest limit reached"}
+    # TRENDING is a rolling 12-hour digest. It must be allowed to refresh on
+    # every scheduled run; the old daily cap silently stopped updates after
+    # the first three deliveries.
     candidates = fetch_trend_candidates()
     with db_connect() as conn:
         recent = {
