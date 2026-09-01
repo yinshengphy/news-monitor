@@ -202,6 +202,14 @@ def init_db() -> None:
             );
             """
         )
+        # Migrate databases created before the rolling TRENDING payload field
+        # was introduced. CREATE TABLE IF NOT EXISTS does not alter an
+        # existing table, so add the column explicitly when necessary.
+        trend_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(trend_pushes)").fetchall()
+        }
+        if "data" not in trend_columns:
+            conn.execute("ALTER TABLE trend_pushes ADD COLUMN data TEXT")
         # A process restart must make an interrupted send retryable. The stable
         # client_id keeps that retry idempotent at the iLink side.
         conn.execute(
