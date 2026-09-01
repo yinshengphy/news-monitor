@@ -36,6 +36,8 @@ DELIVERY_QUEUE_URL = os.environ.get(
     "DELIVERY_QUEUE_URL", "http://127.0.0.1:8787/v1/deliveries"
 )
 DELIVERY_QUEUE_TOKEN = os.environ.get("DELIVERY_QUEUE_TOKEN", "")
+BLOG_PUBLICATION_BASE_URL = os.environ.get("BLOG_PUBLICATION_BASE_URL", "").rstrip("/")
+BLOG_PUBLICATION_TOKEN = os.environ.get("BLOG_PUBLICATION_TOKEN", "")
 
 # News Sources Definition
 SOURCES = {
@@ -169,6 +171,16 @@ def init_db():
         cur.execute("ALTER TABLE processed_items ADD COLUMN incident_key TEXT")
     if "wechat_msg" not in columns:
         cur.execute("ALTER TABLE processed_items ADD COLUMN wechat_msg TEXT")
+    if "blog_status" not in columns:
+        cur.execute("ALTER TABLE processed_items ADD COLUMN blog_status INTEGER DEFAULT 0")
+    if "blog_retry_count" not in columns:
+        cur.execute("ALTER TABLE processed_items ADD COLUMN blog_retry_count INTEGER DEFAULT 0")
+    if "blog_last_retry_at" not in columns:
+        cur.execute("ALTER TABLE processed_items ADD COLUMN blog_last_retry_at TEXT")
+    if "breaking_summary" not in columns:
+        cur.execute("ALTER TABLE processed_items ADD COLUMN breaking_summary TEXT")
+    if "breaking_level" not in columns:
+        cur.execute("ALTER TABLE processed_items ADD COLUMN breaking_level TEXT")
 
     # 2. Active incidents table
     cur.execute("""
@@ -202,19 +214,22 @@ def is_item_processed(item_hash: str) -> bool:
     return row is not None
 
 def record_item(item_hash: str, source: str, title: str, link: str, published_at: str, 
-                score: int, is_pushed: int, push_status: int = 0, incident_key: str = None, wechat_msg: str = None):
+                score: int, is_pushed: int, push_status: int = 0, incident_key: str = None,
+                wechat_msg: str = None, breaking_summary: str = None, breaking_level: str = None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     now_str = datetime.now(timezone.utc).isoformat()
     cur.execute("""
-    INSERT INTO processed_items (hash, source, title, link, published_at, discovered_at, score, is_pushed, push_status, retry_count, last_retry_at, incident_key, wechat_msg)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+    INSERT INTO processed_items (hash, source, title, link, published_at, discovered_at, score, is_pushed, push_status, retry_count, last_retry_at, incident_key, wechat_msg, blog_status, blog_retry_count, blog_last_retry_at, breaking_summary, breaking_level)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, 0, 0, NULL, ?, ?)
     ON CONFLICT(hash) DO UPDATE SET
         score=excluded.score,
         push_status=excluded.push_status,
         incident_key=excluded.incident_key,
-        wechat_msg=excluded.wechat_msg
-    """, (item_hash, source, title, link, published_at, now_str, score, is_pushed, push_status, incident_key, wechat_msg))
+        wechat_msg=excluded.wechat_msg,
+        breaking_summary=excluded.breaking_summary,
+        breaking_level=excluded.breaking_level
+    """, (item_hash, source, title, link, published_at, now_str, score, is_pushed, push_status, incident_key, wechat_msg, breaking_summary, breaking_level))
     conn.commit()
     conn.close()
 
@@ -685,6 +700,95 @@ def enqueue_delivery(
     except Exception as e:
         return False, f"queue error: {e}"
 
+
+def enqueue_breaking_blog_publication(row: tuple) -> tuple[bool, str]:
+    """Store a three-day breaking-news update in blog-service's durable outbox."""
+    if not BLOG_PUBLICATION_BASE_URL or not BLOG_PUBLICATION_TOKEN:
+        return False, "BLOG_PUBLICATION_TOKEN missing"
+    item_hash, source, title, link, discovered_at, summary, level = row
+    payload = json.dumps({
+        "idempotencyKey": f"breaking:{item_hash}",
+        "fingerprint": item_hash,
+        "title": title[:220],
+        "summary": (summary or title)[:600],
+        "source": source[:100],
+        "discoveredAt": discovered_at,
+        "severity": (level or "重大")[:40],
+        "link": (link or "")[:2000],
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{BLOG_PUBLICATION_BASE_URL}/breaking-events",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {BLOG_PUBLICATION_TOKEN}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if resp.status in (200, 202) and (result.get("id") or result.get("duplicate")):
+                return True, "accepted"
+            return False, str(result)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        return False, f"blog publication HTTP {exc.code}: {detail}"
+    except Exception as exc:
+        return False, f"blog publication error: {exc}"
+
+
+def flush_breaking_blog_outbox():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT hash, source, title, link, discovered_at, breaking_summary, breaking_level,
+           blog_retry_count, blog_last_retry_at
+    FROM processed_items
+    WHERE push_status IN (1, 2) AND COALESCE(blog_status, 0) != 2
+    ORDER BY discovered_at ASC
+    LIMIT 5
+    """)
+    pending = cur.fetchall()
+    conn.close()
+
+    now_utc = datetime.now(timezone.utc)
+    for row in pending:
+        item_hash, source, title, link, discovered_at, summary, level, retry_cnt, last_retry_str = row
+        if last_retry_str:
+            try:
+                last_retry_dt = datetime.fromisoformat(last_retry_str)
+                delay_needed = min(3600, 60 * (2 ** min(retry_cnt, 5)))
+                if (now_utc - last_retry_dt).total_seconds() < delay_needed:
+                    continue
+            except Exception:
+                pass
+
+        ok, err = enqueue_breaking_blog_publication(
+            (item_hash, source, title, link, discovered_at, summary, level)
+        )
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        now_str = datetime.now(timezone.utc).isoformat()
+        if ok:
+            cur.execute("""
+                UPDATE processed_items
+                SET blog_status = 2, blog_last_retry_at = ?
+                WHERE hash = ?
+            """, (now_str, item_hash))
+            print(f"[BLOG SUCCESS] Breaking event accepted: {title[:40]}", flush=True)
+        else:
+            next_retry = retry_cnt + 1
+            state = 3 if next_retry >= 8 else 1
+            cur.execute("""
+                UPDATE processed_items
+                SET blog_status = ?, blog_retry_count = ?, blog_last_retry_at = ?
+                WHERE hash = ?
+            """, (state, next_retry, now_str, item_hash))
+            print(f"[BLOG ERROR] Breaking event retry #{next_retry}: {err}", flush=True)
+        conn.commit()
+        conn.close()
+
 def flush_outbox():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -948,7 +1052,9 @@ def poll_all():
                 print(f" -> [PUSH ACCEPTED] Incident '{incident_key}': {reason}", flush=True)
                 msg_card = format_wechat_card(item, analysis)
                 record_item(item["hash"], source, title, item["link"], item["published_at"],
-                            score=score, is_pushed=0, push_status=1, incident_key=incident_key, wechat_msg=msg_card)
+                            score=score, is_pushed=0, push_status=1, incident_key=incident_key,
+                            wechat_msg=msg_card, breaking_summary=analysis.get("summary", ""),
+                            breaking_level=level)
             else:
                 print(f" -> [PUSH SUPPRESSED] Incident '{incident_key}': {reason}", flush=True)
                 record_item(item["hash"], source, title, item["link"], item["published_at"],
@@ -959,6 +1065,7 @@ def poll_all():
             
     # 4. Flush Outbox Queue (Send pending & retry failed alerts)
     flush_outbox()
+    flush_breaking_blog_outbox()
     
     # 5. Refresh Watchdog Heartbeat
     update_heartbeat()

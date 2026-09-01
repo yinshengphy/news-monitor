@@ -49,6 +49,8 @@ CLIPROXY_KEY = os.environ.get("CLIPROXY_API_KEY", "")
 CLIPROXY_BASE_URL = os.environ.get(
     "CLIPROXY_BASE_URL", "http://127.0.0.1:8317/v1"
 ).rstrip("/")
+BLOG_PUBLICATION_BASE_URL = os.environ.get("BLOG_PUBLICATION_BASE_URL", "").rstrip("/")
+BLOG_PUBLICATION_TOKEN = os.environ.get("BLOG_PUBLICATION_TOKEN", "")
 PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "gemini-3.7-flash-high")
 FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-5.6-luna")
 MODEL_TIMEOUT_SECONDS = int(os.environ.get("MODEL_TIMEOUT_SECONDS", "60"))
@@ -443,6 +445,59 @@ def enqueue_delivery(
         "delivery_id": delivery_id,
         "chunks": len(clean_messages),
     }
+
+
+def submit_blog_publication(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist a publish command before delivering the matching WeChat content."""
+    if not BLOG_PUBLICATION_BASE_URL or not BLOG_PUBLICATION_TOKEN:
+        return {"accepted": False, "error": "blog publication is not configured"}
+    request = urllib.request.Request(
+        f"{BLOG_PUBLICATION_BASE_URL}/{path.lstrip('/')}",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {BLOG_PUBLICATION_TOKEN}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            if response.status in (200, 202) and (result.get("id") or result.get("duplicate")):
+                return {"accepted": True, **result}
+            return {"accepted": False, "error": str(result)}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        return {"accepted": False, "error": f"blog publication HTTP {exc.code}: {detail}"}
+    except Exception as exc:
+        return {"accepted": False, "error": f"blog publication error: {exc}"}
+
+
+def publish_scheduled_post(
+    *,
+    idempotency_key: str,
+    slug: str,
+    title: str,
+    now: datetime,
+    description: str,
+    categories: list[str],
+    tags: list[str],
+    messages: list[str],
+) -> dict[str, Any]:
+    body = "\n\n".join(message.strip() for message in messages if message.strip()).strip()
+    result = submit_blog_publication("posts", {
+        "idempotencyKey": idempotency_key,
+        "slug": slug,
+        "title": title,
+        "date": now.strftime("%Y-%m-%d"),
+        "description": description[:280],
+        "categories": categories,
+        "tags": tags,
+        "body": body,
+    })
+    if not result.get("accepted"):
+        raise RuntimeError(result.get("error", "blog publication was rejected"))
+    return result
 
 
 def _load_weixin_token() -> str:
@@ -845,8 +900,19 @@ RSS 候选 JSON：
 """
     result, model = call_model_chain(prompt)
     messages = _require_marked_messages(result)
+    publication = publish_scheduled_post(
+        idempotency_key=f"daily-news:{now:%Y-%m-%d}",
+        slug=f"daily-news-{now:%Y%m%d}",
+        title=f"每日热点早报｜{now:%Y年%m月%d日}",
+        now=now,
+        description="每日热点早报：覆盖国内、国际、财经、科技与科学等重点新闻。",
+        categories=["每日早报"],
+        tags=["热点新闻", "每日早报"],
+        messages=messages,
+    )
     queued = enqueue_delivery(run_key, "daily-news", messages, 60)
     queued["model"] = model
+    queued["publication"] = publication
     return queued
 
 
@@ -934,8 +1000,19 @@ def generate_interview(run_key: str) -> dict[str, Any]:
 """
     result, model = call_model_chain(prompt)
     messages = _require_marked_messages(result)
+    publication = publish_scheduled_post(
+        idempotency_key=f"technical-daily:{now:%Y-%m-%d}",
+        slug=f"technical-daily-{now:%Y%m%d}",
+        title=f"技术深潜｜{now:%Y年%m月%d日}",
+        now=now,
+        description=f"围绕{topic}的生产级技术推演、排障思路与 AI 应用项目推荐。",
+        categories=["每日技术推送"],
+        tags=[topic, "Java", "系统设计", "AI 工程"],
+        messages=messages,
+    )
     queued = enqueue_delivery(run_key, "interview", messages, 55)
     queued["model"] = model
+    queued["publication"] = publication
     return queued
 
 
