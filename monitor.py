@@ -713,8 +713,10 @@ def enqueue_breaking_blog_publication(row: tuple) -> tuple[bool, str]:
         return False, "BLOG_PUBLICATION_TOKEN missing"
     item_hash, source, title, link, discovered_at, breaking_title, summary, level = row
     final_title = (breaking_title or title)[:220]
+    # Use update version in idempotencyKey so modified translations trigger publication
+    title_slug = hashlib.md5(final_title.encode("utf-8")).hexdigest()[:6]
     payload = json.dumps({
-        "idempotencyKey": f"breaking:{item_hash}",
+        "idempotencyKey": f"breaking:{item_hash}:{title_slug}",
         "fingerprint": item_hash,
         "title": final_title,
         "summary": (summary or title)[:600],
