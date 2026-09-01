@@ -484,7 +484,13 @@ def publish_scheduled_post(
     tags: list[str],
     messages: list[str],
 ) -> dict[str, Any]:
-    body = "\n\n".join(message.strip() for message in messages if message.strip()).strip()
+    cleaned_messages = []
+    for msg in messages:
+        # Strip internal [[MESSAGE]] delimiters if present
+        clean_msg = re.sub(r"\[\[MESSAGE\]\]\s*", "", msg).strip()
+        if clean_msg:
+            cleaned_messages.append(clean_msg)
+    body = "\n\n".join(cleaned_messages).strip()
     result = submit_blog_publication("posts", {
         "idempotencyKey": idempotency_key,
         "slug": slug,
