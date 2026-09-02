@@ -10,6 +10,7 @@ class DeliveryServiceTests(unittest.TestCase):
         cls.tempdir = tempfile.TemporaryDirectory()
         os.environ["DELIVERY_DB_PATH"] = os.path.join(cls.tempdir.name, "delivery.db")
         os.environ["WEIXIN_MESSAGE_LIMIT"] = "120"
+        os.environ["ENABLE_WEIXIN_DELIVERY"] = "true"
         cls.service = importlib.import_module("delivery_service")
         cls.service.init_db()
 

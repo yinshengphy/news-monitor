@@ -66,6 +66,10 @@ HEARTBEAT_PATH = os.environ.get(
     "DELIVERY_HEARTBEAT_PATH", "/tmp/delivery_service_heartbeat"
 )
 
+ENABLE_WEIXIN_DELIVERY = (
+    os.environ.get("ENABLE_WEIXIN_DELIVERY", "false").strip().lower()
+    in ("true", "1", "yes", "on")
+)
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; HermesContentService/1.0)",
     "Accept": "application/rss+xml, application/xml, application/json, text/html;q=0.8",
@@ -419,6 +423,35 @@ def enqueue_delivery(
     if len(clean_messages) > 20:
         raise ValueError("too many message chunks")
     now = iso_now()
+    if not ENABLE_WEIXIN_DELIVERY:
+        # WeChat delivery is disabled by user policy; record entry as skipped to preserve idempotency
+        with db_connect() as conn:
+            existing = conn.execute(
+                "SELECT id,status FROM deliveries WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            if existing:
+                return {
+                    "accepted": True,
+                    "duplicate": True,
+                    "delivery_id": existing["id"],
+                    "status": existing["status"],
+                }
+            cur = conn.execute(
+                """
+                INSERT INTO deliveries(idempotency_key,category,priority,status,created_at,updated_at)
+                VALUES(?,?,?,'skipped',?,?)
+                """,
+                (key, category[:80] or "general", max(0, min(100, priority)), now, now),
+            )
+            delivery_id = int(cur.lastrowid or 0)
+        return {
+            "accepted": True,
+            "duplicate": False,
+            "delivery_id": delivery_id,
+            "chunks": 0,
+            "status": "skipped",
+        }
+
     with db_connect() as conn:
         existing = conn.execute(
             "SELECT id,status FROM deliveries WHERE idempotency_key=?", (key,)

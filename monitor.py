@@ -38,6 +38,10 @@ DELIVERY_QUEUE_URL = os.environ.get(
 DELIVERY_QUEUE_TOKEN = os.environ.get("DELIVERY_QUEUE_TOKEN", "")
 BLOG_PUBLICATION_BASE_URL = os.environ.get("BLOG_PUBLICATION_BASE_URL", "").rstrip("/")
 BLOG_PUBLICATION_TOKEN = os.environ.get("BLOG_PUBLICATION_TOKEN", "")
+ENABLE_WEIXIN_DELIVERY = (
+    os.environ.get("ENABLE_WEIXIN_DELIVERY", "false").strip().lower()
+    in ("true", "1", "yes", "on")
+)
 
 # News Sources Definition
 SOURCES = {
@@ -799,6 +803,16 @@ def flush_breaking_blog_outbox():
         conn.close()
 
 def flush_outbox():
+    if not ENABLE_WEIXIN_DELIVERY:
+        # WeChat pushes disabled; mark remaining pending items as skipped
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        now_str = datetime.now(timezone.utc).isoformat()
+        cur.execute("UPDATE processed_items SET push_status = 2, is_pushed = 1, last_retry_at = ? WHERE push_status = 1", (now_str,))
+        conn.commit()
+        conn.close()
+        return
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
