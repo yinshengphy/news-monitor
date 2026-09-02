@@ -537,7 +537,7 @@ def publish_scheduled_post(
         "idempotencyKey": idempotency_key,
         "slug": slug,
         "title": title,
-        "date": now.isoformat(),
+        "date": now.strftime("%Y-%m-%d"),
         "description": description[:280],
         "categories": categories,
         "tags": tags,
