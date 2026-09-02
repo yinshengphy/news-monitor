@@ -537,7 +537,7 @@ def publish_scheduled_post(
         "idempotencyKey": idempotency_key,
         "slug": slug,
         "title": title,
-        "date": now.strftime("%Y-%m-%d"),
+        "date": now.isoformat(),
         "description": description[:280],
         "categories": categories,
         "tags": tags,
@@ -1311,8 +1311,19 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
                     norm_item_title = re.sub(r"\W+", "", item_title.lower())
                     if norm_item_title:
                         seen_titles.add(norm_item_title)
+                    item_time = ""
+                    if row[2]:
+                        try:
+                            # Convert UTC/ISO to Beijing Time string YYYY-MM-DD HH:MM:SS
+                            dt_obj = datetime.fromisoformat(str(row[2]).replace("Z", "+00:00"))
+                            dt_cst = dt_obj.astimezone(TZ)
+                            item_time = dt_cst.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            item_time = str(row[2])
+                    time_line = f"- **核验时间**：`{item_time}`\n" if item_time else ""
                     trend_sections.append(
                         f"### 🔥 {count}｜{item_title}\n"
+                        f"{time_line}"
                         f"- **为什么热**：{item_data.get('why_hot', '')}\n"
                         f"- **已核实事实**：{item_data.get('facts', '')}\n"
                         f"- **影响/关注**：{item_data.get('impact', '')}\n"
@@ -1323,6 +1334,7 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
                     pass
         
         # Also include currently selected items if not yet queried
+        curr_time_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
         for item in valid:
             item_title = item.get("title", "")
             norm_title = re.sub(r"\W+", "", item_title.lower())
@@ -1331,6 +1343,7 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
             seen_titles.add(norm_title)
             trend_sections.append(
                 f"### 🔥 {count}｜{item_title}\n"
+                f"- **核验时间**：`{curr_time_str}`\n"
                 f"- **为什么热**：{item.get('why_hot', '')}\n"
                 f"- **已核实事实**：{item.get('facts', '')}\n"
                 f"- **影响/关注**：{item.get('impact', '')}\n"
