@@ -614,13 +614,13 @@ async def _send_weixin_raw(body: str, client_id: str) -> tuple[bool, str]:
 
 
 def _retry_delay(error: str, attempts: int) -> float:
-    jitter = random.uniform(0, 15)
+    jitter = random.uniform(0, 10)
     if error.startswith("rate_limit"):
-        schedule = (75, 180, 600, 1800, 3600)
+        schedule = (30, 60, 120, 300, 600)
     elif error.startswith("permanent"):
-        schedule = (1800, 3600, 10800, 21600)
+        schedule = (600, 1800, 3600)
     else:
-        schedule = (30, 60, 180, 600, 1800, 3600)
+        schedule = (15, 30, 60, 180, 300)
     return schedule[min(max(attempts - 1, 0), len(schedule) - 1)] + jitter
 
 
@@ -708,9 +708,33 @@ def _finish_chunk(row: sqlite3.Row, ok: bool, error: str) -> None:
             )
 
 
+def _check_token_refresh(last_mtimes: dict[str, float]) -> bool:
+    accounts_dir = Path(HERMES_HOME) / "weixin" / "accounts"
+    changed = False
+    if accounts_dir.is_dir():
+        for tf in accounts_dir.glob("*.context-tokens.json"):
+            try:
+                mtime = tf.stat().st_mtime
+                p_str = str(tf)
+                if p_str in last_mtimes and mtime > last_mtimes[p_str]:
+                    changed = True
+                last_mtimes[p_str] = mtime
+            except Exception:
+                pass
+    return changed
+
+
 def sender_loop() -> None:
+    token_mtimes: dict[str, float] = {}
+    _check_token_refresh(token_mtimes)
     while True:
         try:
+            if _check_token_refresh(token_mtimes):
+                with db_connect() as conn:
+                    conn.execute(
+                        "UPDATE delivery_chunks SET available_at=? WHERE status='pending' AND available_at>?",
+                        (iso_now(), iso_now()),
+                    )
             row = _next_due_chunk()
             if not row:
                 time.sleep(2)
