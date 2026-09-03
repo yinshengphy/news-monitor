@@ -581,14 +581,14 @@ def evaluate_and_summarize(title: str, snippet: str, source: str) -> dict:
     model_used = None
     fallback_used = False
     result_text = None
-    # Step 1: Primary - Gemini 3.7 Flash High through host CLIProxyAPI
+    # Step 1: Primary - Gemini 3.8 Flash High through host CLIProxyAPI
     ok, res = call_cliproxy(PRIMARY_MODEL, prompt)
     if ok:
         record_model_outcome(primary_ok=True)
-        model_used = "Gemini 3.7 Flash High"
+        model_used = PRIMARY_MODEL
         result_text = res
     else:
-        print(f"[Fallback] Gemini 3.7 Flash failed: {res}")
+        print(f"[Fallback] Primary model ({PRIMARY_MODEL}) failed: {res}")
         primary_error = res
         # Step 2: First and only fallback - Codex GPT Luna through the same gateway
         ok, res = call_cliproxy(FALLBACK_MODEL, prompt)
