@@ -1298,56 +1298,58 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
         trend_sections = []
         seen_titles = set()
         count = 1
+        
+        # Merge recent rows and current valid items, deduplicate, and sort by CST time descending
+        all_items_to_render = []
         for row in recent_rows:
-            title = row[1]
-            norm_title = re.sub(r"\W+", "", (title or "").lower())
-            if norm_title in seen_titles:
-                continue
-            seen_titles.add(norm_title)
             if row[3]:
                 try:
-                    item_data = json.loads(row[3])
-                    item_title = item_data.get("title", "")
-                    norm_item_title = re.sub(r"\W+", "", item_title.lower())
-                    if norm_item_title:
-                        seen_titles.add(norm_item_title)
-                    item_time = ""
-                    if row[2]:
-                        try:
-                            # Convert UTC/ISO to Beijing Time string YYYY-MM-DD HH:MM:SS
-                            dt_obj = datetime.fromisoformat(str(row[2]).replace("Z", "+00:00"))
-                            dt_cst = dt_obj.astimezone(TZ)
-                            item_time = dt_cst.strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            item_time = str(row[2])
-                    time_line = f"- **核验时间**：`{item_time}`\n" if item_time else ""
-                    trend_sections.append(
-                        f"### 🔥 {count}｜{item_title}\n"
-                        f"{time_line}"
-                        f"- **为什么热**：{item_data.get('why_hot', '')}\n"
-                        f"- **已核实事实**：{item_data.get('facts', '')}\n"
-                        f"- **影响/关注**：{item_data.get('impact', '')}\n"
-                        f"- **来源**：{'、'.join(str(s) for s in item_data.get('sources', [])[:3])}"
-                    )
-                    count += 1
+                    data_obj = json.loads(row[3])
+                    all_items_to_render.append({
+                        "title": data_obj.get("title", row[1]),
+                        "pushed_at": str(row[2] or ""),
+                        "data": data_obj,
+                    })
                 except Exception:
                     pass
-        
-        # Also include currently selected items if not yet queried
-        curr_time_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+        curr_iso = iso_now()
         for item in valid:
-            item_title = item.get("title", "")
-            norm_title = re.sub(r"\W+", "", item_title.lower())
-            if norm_title in seen_titles:
+            all_items_to_render.append({
+                "title": item.get("title", ""),
+                "pushed_at": curr_iso,
+                "data": item,
+            })
+
+        # Sort all items strictly by pushed_at descending (newest first)
+        all_items_to_render.sort(key=lambda x: str(x.get("pushed_at", "")), reverse=True)
+
+        for entry in all_items_to_render:
+            item_data = entry["data"]
+            item_title = entry["title"]
+            norm_title = re.sub(r"\W+", "", (item_title or "").lower())
+            if not norm_title or norm_title in seen_titles:
                 continue
             seen_titles.add(norm_title)
+
+            item_time = ""
+            raw_time = entry.get("pushed_at", "")
+            if raw_time:
+                try:
+                    dt_obj = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+                    dt_cst = dt_obj.astimezone(TZ)
+                    item_time = dt_cst.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    item_time = str(raw_time)
+
+            time_line = f"- **核验时间**：`{item_time}`\n" if item_time else ""
             trend_sections.append(
                 f"### 🔥 {count}｜{item_title}\n"
-                f"- **核验时间**：`{curr_time_str}`\n"
-                f"- **为什么热**：{item.get('why_hot', '')}\n"
-                f"- **已核实事实**：{item.get('facts', '')}\n"
-                f"- **影响/关注**：{item.get('impact', '')}\n"
-                f"- **来源**：{'、'.join(str(s) for s in item.get('sources', [])[:3])}"
+                f"{time_line}"
+                f"- **为什么热**：{item_data.get('why_hot', '')}\n"
+                f"- **已核实事实**：{item_data.get('facts', '')}\n"
+                f"- **影响/关注**：{item_data.get('impact', '')}\n"
+                f"- **来源**：{'、'.join(str(s) for s in item_data.get('sources', [])[:3])}"
             )
             count += 1
 
