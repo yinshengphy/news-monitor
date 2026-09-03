@@ -51,7 +51,7 @@ CLIPROXY_BASE_URL = os.environ.get(
 ).rstrip("/")
 BLOG_PUBLICATION_BASE_URL = os.environ.get("BLOG_PUBLICATION_BASE_URL", "").rstrip("/")
 BLOG_PUBLICATION_TOKEN = os.environ.get("BLOG_PUBLICATION_TOKEN", "")
-PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "gemini-3.7-flash-high")
+PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", "gemini-3.8-flash-high")
 FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-5.6-luna")
 MODEL_TIMEOUT_SECONDS = int(os.environ.get("MODEL_TIMEOUT_SECONDS", "60"))
 MESSAGE_LIMIT = min(2000, int(os.environ.get("WEIXIN_MESSAGE_LIMIT", "1900")))
