@@ -1370,7 +1370,7 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
         )
 
         publish_scheduled_post(
-            idempotency_key=f"blog:global-trending:{now.strftime('%Y%m%d%H')}",
+            idempotency_key=f"blog:global-trending:{now.strftime('%Y%m%d%H%M%S')}",
             slug="global-trending",
             title="全球热议观察（近12小时动态）",
             now=now,
