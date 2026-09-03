@@ -1284,6 +1284,17 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
     messages.append(current)
     queued = enqueue_delivery(run_key, "global-trends", messages, 45)
     
+    # Persist the newly pushed items into trend_pushes first so they are immediately queryable
+    with db_connect() as conn:
+        for item in valid:
+            conn.execute(
+                """
+                INSERT INTO trend_pushes(fingerprint,title,pushed_at,data) VALUES(?,?,?,?)
+                ON CONFLICT(fingerprint) DO UPDATE SET title=excluded.title, pushed_at=excluded.pushed_at, data=excluded.data
+                """,
+                (item["fingerprint"], str(item.get("title", ""))[:200], iso_now(), json.dumps(item, ensure_ascii=False)),
+            )
+
     # Also publish/update to Blog single trending post
     try:
         with db_connect() as conn:
@@ -1371,15 +1382,6 @@ def generate_trend_digest(run_key: str) -> dict[str, Any]:
     except Exception as exc:
         print(f"[TrendsBlogError] Failed to submit to blog outbox: {exc}")
 
-    with db_connect() as conn:
-        for item in valid:
-            conn.execute(
-                """
-                INSERT INTO trend_pushes(fingerprint,title,pushed_at,data) VALUES(?,?,?,?)
-                ON CONFLICT(fingerprint) DO UPDATE SET title=excluded.title, pushed_at=excluded.pushed_at, data=excluded.data
-                """,
-                (item["fingerprint"], str(item.get("title", ""))[:200], iso_now(), json.dumps(item, ensure_ascii=False)),
-            )
     queued["model"] = model
     queued["topics"] = len(valid)
     return queued
