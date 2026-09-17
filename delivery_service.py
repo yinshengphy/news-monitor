@@ -121,7 +121,7 @@ TOPICS = (
     "消息队列与异步架构",
     "分布式理论与架构",
     "系统设计与高并发架构",
-    "Linux / DevOps / Kubernetes",
+    "Linux、DevOps 与 Kubernetes",
     "软件工程能力与架构演进",
     "AI 工程与大模型应用开发",
 )
@@ -423,7 +423,9 @@ def enqueue_delivery(
     if len(clean_messages) > 20:
         raise ValueError("too many message chunks")
     now = iso_now()
-    if not ENABLE_WEIXIN_DELIVERY:
+    # 微信投递总开关：若关闭，仅放行系统运维高优先级告警（如 model-alert、system-alert），其余常规内容标记为 skipped
+    is_alert_category = category in ("model-alert", "system-alert") or priority >= 90
+    if not ENABLE_WEIXIN_DELIVERY and not is_alert_category:
         # WeChat delivery is disabled by user policy; record entry as skipped to preserve idempotency
         with db_connect() as conn:
             existing = conn.execute(
