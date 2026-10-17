@@ -108,6 +108,7 @@ def create_previewed_draft(
     recipient: str,
     now: datetime | None = None,
     ttl_hours: int = 48,
+    preview_delivered: bool = False,
 ) -> dict[str, Any]:
     """Persist the exact previewed version and supersede older active versions."""
     _validate_date(news_date)
@@ -137,10 +138,10 @@ def create_previewed_draft(
           recipient_hash,status,created_at,previewed_at,expires_at,publish_key,updated_at
         ) VALUES(?,?,?,?,?,?,?,?,'previewed',?,?,?,?,?)""",
         (public_id, news_date, generation_date, version, cleaned, digest, sources_json,
-         recipient_digest, stamp, stamp, expires, publish_key, stamp),
+         recipient_digest, stamp, stamp if preview_delivered else None, expires, publish_key, stamp),
     )
     conn.commit()
-    return {"public_id": public_id, "version": version, "body_hash": digest,
+    return {"public_id": public_id, "version": version, "body_hash": digest, "body": cleaned,
             "expires_at": expires, "status": "previewed"}
 
 
@@ -186,6 +187,8 @@ def approve(
     """Publish the exact previewed bytes, with a stable key across retries."""
     current = _now(now)
     row = _resolve(conn, recipient, draft_id, current)
+    if not row["previewed_at"]:
+        raise ValueError("draft preview has not been delivered")
     if row["status"] == "published":
         return {"status": "published", "duplicate": True, "public_id": row["public_id"]}
     if row["status"] not in ("previewed", "publish_failed"):
@@ -240,6 +243,8 @@ def replace_and_preview(
 ) -> dict[str, Any]:
     current = _now(now)
     row = _resolve(conn, recipient, draft_id, current)
+    if row["status"] not in ("previewed", "publish_failed"):
+        raise ValueError("draft cannot be modified")
     if not old or old not in row["body"] or not new:
         raise ValueError("replacement text does not match exactly")
     updated = row["body"].replace(old, new, 1)

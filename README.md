@@ -28,6 +28,8 @@ Hermes 插件源码位于 `hermes_plugins/news-review-direct/`。它仅接受配
 
 草稿默认 48 小时过期；发布失败可用同一命令重试，正文 hash 和幂等键保持不变。审批接口复用 `DELIVERY_QUEUE_TOKEN`，插件运行时凭据与身份 hash 必须放在 `~/.hermes/secrets/`（权限 `0600`），不得提交到 Git。
 
+初稿及修改后的完整正文均通过持久化微信队列预览，全部分片投递成功后才允许确认。投递回执代表平台接受，无法证明用户实际阅读。Hermes 会运行所有 `pre_gateway_dispatch` 回调，插件排序不能替代隔离；已有随笔插件需应用 `hermes_plugins/essay-news-isolation.patch`，让新闻命令在随笔等待正文期间也保持独立。
+
 ## 🚀 部署运行
 
 ### 本地 / 容器运行

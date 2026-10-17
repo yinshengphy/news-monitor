@@ -1,0 +1,14 @@
+--- a/__init__.py
++++ b/__init__.py
+@@ -261,6 +261,13 @@
+     if not text or not isinstance(text, str):
+         return None
+ 
++    # All gateway hooks run, including after another plugin returns skip.
++    if getattr(event, "_news_review_command", False) or re.fullmatch(
++        r"(?:待审新闻|同意发布(?:\s+\S+)?|不发布(?:\s+\S+)?|修改新闻[：:].+)", text.strip()
++    ):
++        return None
++
+     if not _is_essay_command(text):
+         return None

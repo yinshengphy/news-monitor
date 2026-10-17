@@ -133,6 +133,9 @@ def pre_gateway_dispatch(event: Any, gateway: Any, session_store: Any,
     command = _parse(text) if isinstance(text, str) else None
     if not command:
         return None
+    # Hermes invokes all hooks even when an earlier hook returns skip.
+    # The essay hook must explicitly yield recognized news commands.
+    setattr(event, "_news_review_command", True)
     # Recognized commands from groups/other identities are consumed and
     # rejected without revealing whether a draft exists.
     if not _authorized(event.source):

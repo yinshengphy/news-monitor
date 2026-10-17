@@ -2,6 +2,7 @@ import importlib
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 
@@ -24,6 +25,39 @@ class DeliveryServiceTests(unittest.TestCase):
             "[[MESSAGE]]\n第一条完整消息\n\n完整段落\n[[MESSAGE]]\n第二条完整消息"
         )
         self.assertEqual(messages, ["第一条完整消息\n\n完整段落", "第二条完整消息"])
+
+    def test_preview_receipt_and_modified_version_gate_publication(self):
+        import news_review
+        body = "## 境外报道与争议议题\n\n隔离测试事实。"
+        with self.service.db_connect() as conn:
+            draft = news_review.create_previewed_draft(
+                conn, news_date="2026-10-17", generation_date="2026-10-17", body=body,
+                sources=[{"name": "Example", "url": "https://example.com/report",
+                          "published": "2026-10-17T01:00:00Z"}], recipient="test-owner")
+        self.service.queue_news_review_preview(draft)
+        command = {"identity": "test-owner", "command": "approve", "draft_id": draft["public_id"]}
+        with patch.object(self.service, "submit_blog_publication", return_value={"accepted": True}) as publisher:
+            with self.assertRaisesRegex(ValueError, "preview"):
+                self.service.handle_news_review_command(command)
+            publisher.assert_not_called()
+            with self.service.db_connect() as conn:
+                conn.execute("UPDATE deliveries SET status='sent' WHERE idempotency_key=?",
+                             ("news-review-preview:" + draft["public_id"],))
+            modified = self.service.handle_news_review_command({
+                **command, "command": "replace", "old": "事实", "new": "新事实"})
+            command["draft_id"] = modified["public_id"]
+            with self.assertRaisesRegex(ValueError, "preview"):
+                self.service.handle_news_review_command(command)
+            with self.service.db_connect() as conn:
+                chunks = conn.execute("""SELECT body FROM delivery_chunks WHERE delivery_id=? ORDER BY seq""",
+                                      (modified["delivery"]["delivery_id"],)).fetchall()
+                self.assertIn("新事实", "".join(row[0] for row in chunks))
+                conn.execute("UPDATE deliveries SET status='sent' WHERE idempotency_key=?",
+                             ("news-review-preview:" + modified["public_id"],))
+            self.assertEqual(self.service.handle_news_review_command(command)["status"], "published")
+            self.service.handle_news_review_command(command)
+            self.assertEqual(publisher.call_count, 1)
+            self.assertEqual(publisher.call_args.args[1]["body"], modified["body"])
 
     def test_enqueue_is_idempotent_and_client_id_is_stable(self):
         first = self.service.enqueue_delivery(

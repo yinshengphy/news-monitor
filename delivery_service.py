@@ -963,15 +963,24 @@ def prepare_news_review(candidates: list[dict[str, Any]], now: datetime) -> dict
             generation_date=now.strftime("%Y-%m-%d"), body=body, sources=sources,
             recipient=f"weixin:{WEIXIN_RECEIVER}", now=now.astimezone(timezone.utc),
         )
+    queue_news_review_preview(draft)
+    return {"draft": draft, "model": model}
+
+
+def queue_news_review_preview(draft: dict[str, Any]) -> dict[str, Any]:
+    # Approval becomes available only once every preview chunk has been sent.
+    with db_connect() as conn:
+        conn.execute("UPDATE news_review_drafts SET previewed_at=NULL WHERE public_id=?",
+                     (draft["public_id"],))
     preview = (
-        "🔒 **境外报道与争议议题｜待审批，尚未公开**\n\n" + body +
+        "🔒 **境外报道与争议议题｜待审批，尚未公开**\n\n" + draft["body"] +
         f"\n\n草稿：{draft['public_id']}｜48小时内有效\n"
         "回复“同意发布”可发布唯一待审稿；多份时请带草稿编号。"
         "回复“不发布”取消；修改请用“修改新闻：旧内容改成新内容”。"
     )
     queued = enqueue_delivery(
         f"news-review-preview:{draft['public_id']}", "news-review-preview", [preview], 80)
-    return {"draft": draft, "delivery": queued, "model": model}
+    return queued
 
 
 def _call_model(model: str, prompt: str) -> tuple[bool, str]:
@@ -1603,6 +1612,15 @@ def handle_news_review_command(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("identity is required")
     with db_connect() as conn:
         if command == "approve":
+            conn.execute("""UPDATE news_review_drafts SET previewed_at=NULL
+                WHERE status IN ('previewed','publish_failed') AND NOT EXISTS (
+                  SELECT 1 FROM deliveries d WHERE d.idempotency_key=
+                  'news-review-preview:' || news_review_drafts.public_id AND d.status='sent')""")
+            conn.execute("""UPDATE news_review_drafts SET previewed_at=?
+                WHERE previewed_at IS NULL AND EXISTS (
+                  SELECT 1 FROM deliveries d WHERE d.idempotency_key=
+                  'news-review-preview:' || news_review_drafts.public_id AND d.status='sent')""",
+                         (iso_now(),))
             result = news_review.approve(
                 conn, recipient=identity, draft_id=draft_id,
                 publisher=submit_blog_publication,
@@ -1619,6 +1637,8 @@ def handle_news_review_command(payload: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             raise ValueError("unsupported news review command")
+    if command == "replace":
+        result["delivery"] = queue_news_review_preview(result)
     return result
 
 

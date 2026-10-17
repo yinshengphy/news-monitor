@@ -24,6 +24,7 @@ class NewsReviewTests(unittest.TestCase):
         return news_review.create_previewed_draft(
             self.conn, news_date=date, generation_date="2026-10-17", body=body,
             sources=SOURCES, recipient=recipient, now=now,
+            preview_delivered=True,
         )
 
     def test_unapproved_draft_never_calls_publisher(self):
@@ -101,6 +102,9 @@ class NewsReviewTests(unittest.TestCase):
         rows = self.conn.execute("SELECT version,status,body FROM news_review_drafts ORDER BY version").fetchall()
         self.assertEqual(rows[0]["status"], "superseded")
         self.assertEqual(rows[1]["status"], "previewed")
+        with self.assertRaisesRegex(ValueError, "preview"):
+            news_review.approve(self.conn, recipient="owner", draft_id=changed["public_id"],
+                                now=NOW, publisher=lambda *_: self.fail("unseen version published"))
         self.assertIn("经核实", rows[1]["body"])
 
     def test_source_and_body_validation_fail_closed(self):
