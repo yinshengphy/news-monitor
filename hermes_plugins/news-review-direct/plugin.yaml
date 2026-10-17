@@ -1,0 +1,6 @@
+name: news-review-direct
+version: 1.0.1
+description: Private daily news review commands with explicit identity checks
+author: User
+hooks:
+  - pre_gateway_dispatch

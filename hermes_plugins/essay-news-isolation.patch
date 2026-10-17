@@ -1,6 +1,6 @@
 --- a/__init__.py
 +++ b/__init__.py
-@@ -261,6 +261,13 @@
+@@ -261,5 +261,11 @@
      if not text or not isinstance(text, str):
          return None
  
