@@ -2,6 +2,7 @@ import importlib
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 
 class DeliveryServiceTests(unittest.TestCase):
@@ -60,6 +61,30 @@ class DeliveryServiceTests(unittest.TestCase):
         messages = self.service.semantic_split(oversized)
         self.assertTrue(all(len(message) <= 120 for message in messages))
         self.assertTrue(all(message.startswith("```text\n") and message.endswith("\n```") for message in messages))
+
+    def test_rss_parser_keeps_real_link_and_publication_time(self):
+        rows = self.service._parse_rss("Source", "国际", b"""
+          <rss><channel><item><title>Report</title>
+          <link>https://example.com/report</link>
+          <pubDate>Sat, 17 Oct 2026 01:00:00 GMT</pubDate>
+          <description>Facts only</description></item></channel></rss>""")
+        self.assertEqual(rows[0]["url"], "https://example.com/report")
+        self.assertTrue(rows[0]["published"].startswith("2026-10-17T01:00:00"))
+
+    def test_review_omits_stale_or_undated_candidates_without_model_call(self):
+        original_receiver = self.service.WEIXIN_RECEIVER
+        original_model = self.service.call_model_chain
+        self.service.WEIXIN_RECEIVER = "configured-recipient"
+        self.service.call_model_chain = lambda _: self.fail("model must not be called")
+        try:
+            result = self.service.prepare_news_review([
+                {"url": "https://example.com/old", "published": "2026-10-01T00:00:00Z"},
+                {"url": "https://example.com/unknown", "published": ""},
+            ], datetime(2026, 10, 17, 7, tzinfo=timezone.utc))
+        finally:
+            self.service.WEIXIN_RECEIVER = original_receiver
+            self.service.call_model_chain = original_model
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
